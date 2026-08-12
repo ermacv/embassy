@@ -35,7 +35,7 @@ use core::task::{Context, Poll};
 pub use embassy_net_driver as driver;
 use embassy_net_driver::{Driver, LinkState};
 use embassy_sync::waitqueue::WakerRegistration;
-use embassy_time::{Instant, Timer};
+use embassy_time::{Duration, Instant, Timer};
 use heapless::Vec;
 #[cfg(feature = "dns")]
 pub use smoltcp::config::DNS_MAX_SERVER_COUNT;
@@ -43,7 +43,7 @@ pub use smoltcp::config::DNS_MAX_SERVER_COUNT;
 pub use smoltcp::iface::MulticastError;
 #[cfg(any(feature = "dns", feature = "dhcpv4"))]
 use smoltcp::iface::SocketHandle;
-use smoltcp::iface::{Interface, SocketSet, SocketStorage};
+use smoltcp::iface::{Interface, PollIngressSingleResult, PollResult, SocketSet, SocketStorage};
 use smoltcp::phy::Medium;
 #[cfg(feature = "dhcpv4")]
 use smoltcp::socket::dhcpv4::{self, RetryConfig};
@@ -268,6 +268,20 @@ pub enum ConfigV6 {
 pub struct Runner<'d, D: Driver> {
     driver: D,
     stack: Stack<'d>,
+}
+
+/// Maximum uninterrupted residence of one directionally fair network poll.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CooperativeConfig {
+    /// Longest residence allowed before the runner returns to its executor.
+    pub max_poll_duration: Duration,
+}
+
+impl CooperativeConfig {
+    /// Create a runner policy with the supplied residence limit.
+    pub const fn new(max_poll_duration: Duration) -> Self {
+        Self { max_poll_duration }
+    }
 }
 
 /// Network stack handle
@@ -851,6 +865,14 @@ impl Inner {
     }
 
     fn poll<D: Driver>(&mut self, cx: &mut Context<'_>, driver: &mut D) {
+        self.poll_with(cx, driver, None)
+    }
+
+    fn poll_cooperative<D: Driver>(&mut self, cx: &mut Context<'_>, driver: &mut D, config: CooperativeConfig) {
+        self.poll_with(cx, driver, Some(config))
+    }
+
+    fn poll_with<D: Driver>(&mut self, cx: &mut Context<'_>, driver: &mut D, cooperative: Option<CooperativeConfig>) {
         self.waker.register(cx.waker());
 
         let (_hardware_addr, medium) = to_smoltcp_hardware_address(driver.hardware_address());
@@ -877,8 +899,28 @@ impl Inner {
             medium,
             tx_exhausted: false,
         };
-        self.iface.poll(timestamp, &mut smoldev, &mut self.sockets);
+        let mut cooperative_worked = false;
+        if let Some(config) = cooperative {
+            self.iface.poll_maintenance(timestamp);
+            let started = Instant::now();
+            loop {
+                let ingress = self
+                    .iface
+                    .poll_ingress_single(timestamp, &mut smoldev, &mut self.sockets);
+                let egress = self.iface.poll_egress(timestamp, &mut smoldev, &mut self.sockets);
+                cooperative_worked = ingress != PollIngressSingleResult::None || egress != PollResult::None;
+                if !cooperative_worked || started.elapsed() >= config.max_poll_duration {
+                    break;
+                }
+            }
+        } else {
+            self.iface.poll(timestamp, &mut smoldev, &mut self.sockets);
+        }
         let tx_exhausted = smoldev.tx_exhausted;
+        drop(smoldev);
+        if cooperative_worked {
+            cx.waker().wake_by_ref();
+        }
 
         // Update link up
         let old_link_up = self.link_up;
@@ -982,6 +1024,22 @@ impl<'d, D: Driver> Runner<'d, D> {
     pub async fn run(&mut self) -> ! {
         poll_fn(|cx| {
             self.stack.with_mut(|i| i.poll(cx, &mut self.driver));
+            Poll::<()>::Pending
+        })
+        .await;
+        unreachable!()
+    }
+
+    /// Run the network stack with bounded, directionally fair polling.
+    ///
+    /// Each round processes at most one ingress packet before polling egress.
+    /// Rounds repeat only until the configured residence limit, then a
+    /// self-wake returns ownership to the cooperative executor before work
+    /// continues.
+    pub async fn run_cooperative(&mut self, config: CooperativeConfig) -> ! {
+        poll_fn(|cx| {
+            self.stack
+                .with_mut(|i| i.poll_cooperative(cx, &mut self.driver, config));
             Poll::<()>::Pending
         })
         .await;

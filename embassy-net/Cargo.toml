@@ -53,6 +53,11 @@ target = "thumbv7em-none-eabi"
 features = ["defmt", "tcp", "udp", "raw", "dns", "icmp", "dhcpv4", "proto-ipv6", "medium-ethernet", "medium-ip", "medium-ieee802154", "multicast", "dhcpv4-hostname"]
 
 [features]
+## Place the measured smoltcp packet emit and egress path in semantic hot
+## sections. The final firmware linker decides which executable memory backs
+## those sections.
+_perf-hotpath = ["smoltcp/_perf-hotpath-emit"]
+
 ## Enable defmt
 defmt = ["dep:defmt", "smoltcp/defmt", "embassy-net-driver/defmt", "embassy-time/defmt", "heapless/defmt", "defmt?/ip_in_core"]
 ## Enable log
@@ -107,14 +112,14 @@ alloc = ["smoltcp/alloc"]
 defmt = { version = "1.0.1", optional = true }
 log = { version = "0.4.14", optional = true }
 
-smoltcp = {  version = "0.13.0", default-features = false, features = [
+smoltcp = { git = "https://github.com/ermacv/smoltcp", rev = "537b05449fcd896cc66a80c0a16e4699b4a2c57e", default-features = false, features = [
   "socket",
   "async",
 ] }
 
-embassy-net-driver = { version = "0.2.0", path = "../embassy-net-driver" }
-embassy-time = { version = "0.5.1", path = "../embassy-time" }
-embassy-sync = { version = "0.8.0", path = "../embassy-sync" }
+embassy-net-driver = { version = "0.2.0" }
+embassy-time = { version = "0.5.1" }
+embassy-sync = { version = "0.8.0" }
 embedded-io-async = { version = "0.7.0" }
 
 managed = { version = "0.8.0", default-features = false, features = [ "map" ] }
