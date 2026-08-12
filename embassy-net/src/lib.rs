@@ -64,10 +64,9 @@ pub use smoltcp::wire::{Ipv6Address, Ipv6Cidr};
 
 use crate::driver_util::DriverAdapter;
 use crate::time::{instant_from_smoltcp, instant_to_smoltcp};
-pub use cooperative::CooperativeConfig;
 #[cfg(feature = "cooperative-scheduler-telemetry")]
 pub use cooperative::{CooperativePollExit, CooperativePollReport};
-use cooperative::{CooperativePollState, DIRECTION_QUANTUM, take_start_direction};
+use cooperative::{CooperativePollState, DIRECTION_QUANTUM, EGRESS_LIMIT, take_start_direction};
 
 const LOCAL_PORT_MIN: u16 = 1025;
 const LOCAL_PORT_MAX: u16 = 65535;
@@ -339,6 +338,8 @@ pub fn new<'d, D: Driver, const SOCK: usize>(
             medium,
             tx_exhausted: false,
             tx_tokens_issued: 0,
+            tx_token_limit: None,
+            tx_budget_exhausted: false,
         },
         instant_to_smoltcp(Instant::now()),
     );
@@ -859,14 +860,37 @@ impl Inner {
     }
 
     fn poll<D: Driver>(&mut self, cx: &mut Context<'_>, driver: &mut D) {
-        self.poll_with(cx, driver, None)
+        self.poll_with(
+            cx,
+            driver,
+            false,
+            #[cfg(feature = "cooperative-scheduler-telemetry")]
+            None,
+        )
     }
 
-    fn poll_cooperative<D: Driver>(&mut self, cx: &mut Context<'_>, driver: &mut D, config: CooperativeConfig) {
-        self.poll_with(cx, driver, Some(config))
+    fn poll_work_conserving<D: Driver>(
+        &mut self,
+        cx: &mut Context<'_>,
+        driver: &mut D,
+        #[cfg(feature = "cooperative-scheduler-telemetry")] observer: Option<fn(CooperativePollReport)>,
+    ) {
+        self.poll_with(
+            cx,
+            driver,
+            true,
+            #[cfg(feature = "cooperative-scheduler-telemetry")]
+            observer,
+        )
     }
 
-    fn poll_with<D: Driver>(&mut self, cx: &mut Context<'_>, driver: &mut D, cooperative: Option<CooperativeConfig>) {
+    fn poll_with<D: Driver>(
+        &mut self,
+        cx: &mut Context<'_>,
+        driver: &mut D,
+        work_conserving: bool,
+        #[cfg(feature = "cooperative-scheduler-telemetry")] observer: Option<fn(CooperativePollReport)>,
+    ) {
         self.waker.register(cx.waker());
 
         let (_hardware_addr, medium) = to_smoltcp_hardware_address(driver.hardware_address());
@@ -893,15 +917,15 @@ impl Inner {
             medium,
             tx_exhausted: false,
             tx_tokens_issued: 0,
+            tx_token_limit: None,
+            tx_budget_exhausted: false,
         };
         let mut cooperative_state = None;
-        if let Some(config) = cooperative {
+        if work_conserving {
             self.iface.poll_maintenance(timestamp);
-            let started = Instant::now();
             let starts_with_ingress = take_start_direction(&mut self.cooperative_starts_with_ingress);
             let mut state = CooperativePollState::new(starts_with_ingress);
-            let mut time_exhausted = false;
-            while state.can_poll() && !time_exhausted {
+            while state.can_poll() {
                 for ingress_turn in [starts_with_ingress, !starts_with_ingress] {
                     if ingress_turn {
                         for _ in 0..DIRECTION_QUANTUM {
@@ -912,35 +936,28 @@ impl Inner {
                                 .iface
                                 .poll_ingress_single(timestamp, &mut smoldev, &mut self.sockets);
                             state.record_ingress(ingress);
-                            time_exhausted = started.elapsed() >= config.max_poll_duration;
-                            if time_exhausted {
-                                break;
-                            }
                         }
                     } else {
-                        for _ in 0..DIRECTION_QUANTUM {
-                            if !state.can_poll_egress() {
-                                break;
-                            }
+                        if state.can_poll_egress() {
                             let issued_before = smoldev.tx_tokens_issued;
+                            let quantum_end = issued_before
+                                .saturating_add(u32::from(DIRECTION_QUANTUM))
+                                .min(u32::from(EGRESS_LIMIT));
+                            smoldev.set_tx_token_limit(Some(quantum_end));
                             let egress = self.iface.poll_egress(timestamp, &mut smoldev, &mut self.sockets);
                             let issued = smoldev.tx_tokens_issued.saturating_sub(issued_before);
                             let blocked = smoldev.take_tx_exhausted();
-                            state.record_egress(egress, issued, blocked);
-                            time_exhausted = started.elapsed() >= config.max_poll_duration;
-                            if time_exhausted {
-                                break;
-                            }
+                            let quantum_exhausted = smoldev.take_tx_budget_exhausted();
+                            state.record_egress(egress, issued, blocked, quantum_exhausted);
                         }
-                    }
-                    if time_exhausted {
-                        break;
                     }
                 }
             }
             #[cfg(feature = "cooperative-scheduler-telemetry")]
-            config.observe(state.report(started.elapsed().as_micros(), time_exhausted));
-            let self_wake = state.should_self_wake(time_exhausted);
+            if let Some(observer) = observer {
+                observer(state.report());
+            }
+            let self_wake = state.should_self_wake();
             cooperative_state = Some((state.egress_blocked, self_wake));
         } else {
             self.iface.poll(timestamp, &mut smoldev, &mut self.sockets);
@@ -1059,16 +1076,33 @@ impl<'d, D: Driver> Runner<'d, D> {
         unreachable!()
     }
 
-    /// Run the network stack with bounded, directionally fair polling.
+    /// Run a bounded, directionally fair, work-conserving network stack.
     ///
-    /// Each round processes symmetric four-operation ingress and egress
-    /// quanta, alternating the first direction between executor polls. Work
-    /// is additionally bounded to 32 operations per direction and by the
-    /// configured residence limit.
-    pub async fn run_cooperative(&mut self, config: CooperativeConfig) -> ! {
+    /// The scheduling policy is owned here rather than supplied by the caller:
+    /// test direction and benchmark configuration cannot change production
+    /// behavior.
+    pub async fn run_work_conserving(&mut self) -> ! {
+        poll_fn(|cx| {
+            self.stack.with_mut(|i| {
+                i.poll_work_conserving(
+                    cx,
+                    &mut self.driver,
+                    #[cfg(feature = "cooperative-scheduler-telemetry")]
+                    None,
+                )
+            });
+            Poll::<()>::Pending
+        })
+        .await;
+        unreachable!()
+    }
+
+    /// Qualification-only observation of the production scheduling policy.
+    #[cfg(feature = "cooperative-scheduler-telemetry")]
+    pub async fn run_work_conserving_observed(&mut self, observer: fn(CooperativePollReport)) -> ! {
         poll_fn(|cx| {
             self.stack
-                .with_mut(|i| i.poll_cooperative(cx, &mut self.driver, config));
+                .with_mut(|i| i.poll_work_conserving(cx, &mut self.driver, Some(observer)));
             Poll::<()>::Pending
         })
         .await;

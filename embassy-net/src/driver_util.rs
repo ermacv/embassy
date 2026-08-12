@@ -14,11 +14,22 @@ where
     pub medium: Medium,
     pub tx_exhausted: bool,
     pub tx_tokens_issued: u32,
+    pub tx_token_limit: Option<u32>,
+    pub tx_budget_exhausted: bool,
 }
 
 impl<T: Driver> DriverAdapter<'_, '_, T> {
     pub fn take_tx_exhausted(&mut self) -> bool {
         core::mem::replace(&mut self.tx_exhausted, false)
+    }
+
+    pub fn set_tx_token_limit(&mut self, limit: Option<u32>) {
+        self.tx_token_limit = limit;
+        self.tx_budget_exhausted = false;
+    }
+
+    pub fn take_tx_budget_exhausted(&mut self) -> bool {
+        core::mem::replace(&mut self.tx_budget_exhausted, false)
     }
 }
 
@@ -43,6 +54,10 @@ where
 
     /// Construct a transmit token.
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
+        if self.tx_token_limit.is_some_and(|limit| self.tx_tokens_issued >= limit) {
+            self.tx_budget_exhausted = true;
+            return None;
+        }
         let token = self.inner.transmit(unwrap!(self.cx.as_deref_mut())).map(TxTokenAdapter);
 
         if token.is_some() {
