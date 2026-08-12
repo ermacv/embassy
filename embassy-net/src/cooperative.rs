@@ -182,10 +182,12 @@ impl CooperativePollState {
     }
 
     /// A hardware-credit stop must first return CPU ownership to the radio
-    /// task. If RX was not proved unavailable, schedule exactly one later
-    /// ingress-first turn; Embassy fairness places other ready tasks before it.
+    /// task. If egress stopped before RX was polled at all, schedule exactly
+    /// one later ingress-first turn; Embassy fairness places other ready tasks
+    /// before it. An already serviced ingress direction waits for its normal
+    /// driver wake instead of keeping the network task continuously runnable.
     pub(crate) fn needs_forced_ingress_followup(&self) -> bool {
-        self.egress_hardware_blocked && !self.ingress_unavailable
+        self.egress_hardware_blocked && self.ingress_calls == 0
     }
 
     pub(crate) fn should_self_wake(&self, time_exhausted: bool) -> bool {
@@ -239,6 +241,15 @@ mod tests {
         assert!(!state.can_poll_egress());
         assert!(state.needs_forced_ingress_followup());
         assert!(state.should_self_wake(false));
+    }
+
+    #[test]
+    fn hardware_credit_does_not_reschedule_already_serviced_ingress() {
+        let mut state = CooperativePollState::new(CONFIG, true);
+        state.record_ingress(PollIngressSingleResult::PacketProcessed);
+        state.record_egress(PollResult::None, 0, true, false);
+        assert!(!state.needs_forced_ingress_followup());
+        assert!(!state.should_self_wake(false));
     }
 
     #[test]
