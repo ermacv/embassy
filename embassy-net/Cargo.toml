@@ -53,9 +53,6 @@ target = "thumbv7em-none-eabi"
 features = ["defmt", "tcp", "udp", "raw", "dns", "icmp", "dhcpv4", "proto-ipv6", "medium-ethernet", "medium-ip", "medium-ieee802154", "multicast", "dhcpv4-hostname"]
 
 [features]
-## Place the measured smoltcp packet emit path in a semantic hot section. The
-## final firmware linker decides which executable memory backs the section.
-_perf-hotpath = ["smoltcp/_perf-hotpath-emit"]
 ## Publish one aggregate report after every cooperative runner poll.
 ## This is intended for diagnostic firmware only: production builds compile
 ## out both the callback and report construction.
@@ -115,7 +112,7 @@ alloc = ["smoltcp/alloc"]
 defmt = { version = "1.0.1", optional = true }
 log = { version = "0.4.14", optional = true }
 
-smoltcp = { git = "https://github.com/ermacv/smoltcp", rev = "537b05449fcd896cc66a80c0a16e4699b4a2c57e", default-features = false, features = [
+smoltcp = { version = "0.13.1", default-features = false, features = [
   "socket",
   "async",
 ] }
