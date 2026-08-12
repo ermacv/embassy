@@ -13,6 +13,13 @@ where
     pub inner: &'d mut T,
     pub medium: Medium,
     pub tx_exhausted: bool,
+    pub tx_tokens_issued: u32,
+}
+
+impl<T: Driver> DriverAdapter<'_, '_, T> {
+    pub fn take_tx_exhausted(&mut self) -> bool {
+        core::mem::replace(&mut self.tx_exhausted, false)
+    }
 }
 
 impl<'d, 'c, T> phy::Device for DriverAdapter<'d, 'c, T>
@@ -38,7 +45,11 @@ where
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
         let token = self.inner.transmit(unwrap!(self.cx.as_deref_mut())).map(TxTokenAdapter);
 
-        self.tx_exhausted = token.is_none();
+        if token.is_some() {
+            self.tx_tokens_issued = self.tx_tokens_issued.saturating_add(1);
+        } else {
+            self.tx_exhausted = true;
+        }
 
         token
     }

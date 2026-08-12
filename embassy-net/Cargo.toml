@@ -56,9 +56,10 @@ features = ["defmt", "tcp", "udp", "raw", "dns", "icmp", "dhcpv4", "proto-ipv6",
 ## Place the measured smoltcp packet emit path in a semantic hot section. The
 ## final firmware linker decides which executable memory backs the section.
 _perf-hotpath = ["smoltcp/_perf-hotpath-emit"]
-## Optional measured UDP ingress placement. Kept separate because executable
-## SRAM budgets and RX/TX traffic mixes differ between targets.
-_perf-hotpath-ingress = ["smoltcp/_perf-hotpath-ingress"]
+## Publish one aggregate report after every cooperative runner poll.
+## This is intended for diagnostic firmware only: production builds compile
+## out both the callback and report construction.
+cooperative-scheduler-telemetry = []
 
 ## Enable defmt
 defmt = ["dep:defmt", "smoltcp/defmt", "embassy-net-driver/defmt", "embassy-time/defmt", "heapless/defmt", "defmt?/ip_in_core"]

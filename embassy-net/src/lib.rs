@@ -13,6 +13,7 @@ compile_error!("You must enable at least one of the following features: proto-ip
 // This mod MUST go first, so that the others see its macros.
 pub(crate) mod fmt;
 
+mod cooperative;
 #[cfg(feature = "dns")]
 pub mod dns;
 mod driver_util;
@@ -35,7 +36,7 @@ use core::task::{Context, Poll};
 pub use embassy_net_driver as driver;
 use embassy_net_driver::{Driver, LinkState};
 use embassy_sync::waitqueue::WakerRegistration;
-use embassy_time::{Duration, Instant, Timer};
+use embassy_time::{Instant, Timer};
 use heapless::Vec;
 #[cfg(feature = "dns")]
 pub use smoltcp::config::DNS_MAX_SERVER_COUNT;
@@ -43,7 +44,7 @@ pub use smoltcp::config::DNS_MAX_SERVER_COUNT;
 pub use smoltcp::iface::MulticastError;
 #[cfg(any(feature = "dns", feature = "dhcpv4"))]
 use smoltcp::iface::SocketHandle;
-use smoltcp::iface::{Interface, PollIngressSingleResult, PollResult, SocketSet, SocketStorage};
+use smoltcp::iface::{Interface, SocketSet, SocketStorage};
 use smoltcp::phy::Medium;
 #[cfg(feature = "dhcpv4")]
 use smoltcp::socket::dhcpv4::{self, RetryConfig};
@@ -63,6 +64,10 @@ pub use smoltcp::wire::{Ipv6Address, Ipv6Cidr};
 
 use crate::driver_util::DriverAdapter;
 use crate::time::{instant_from_smoltcp, instant_to_smoltcp};
+pub use cooperative::CooperativeConfig;
+#[cfg(feature = "cooperative-scheduler-telemetry")]
+pub use cooperative::{CooperativePollExit, CooperativePollReport};
+use cooperative::{CooperativePollState, DIRECTION_QUANTUM, take_start_direction};
 
 const LOCAL_PORT_MIN: u16 = 1025;
 const LOCAL_PORT_MAX: u16 = 65535;
@@ -270,20 +275,6 @@ pub struct Runner<'d, D: Driver> {
     stack: Stack<'d>,
 }
 
-/// Maximum uninterrupted residence of one directionally fair network poll.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CooperativeConfig {
-    /// Longest residence allowed before the runner returns to its executor.
-    pub max_poll_duration: Duration,
-}
-
-impl CooperativeConfig {
-    /// Create a runner policy with the supplied residence limit.
-    pub const fn new(max_poll_duration: Duration) -> Self {
-        Self { max_poll_duration }
-    }
-}
-
 /// Network stack handle
 ///
 /// Use this to create sockets. It's `Copy`, so you can pass
@@ -317,6 +308,7 @@ pub(crate) struct Inner {
     dns_waker: WakerRegistration,
     #[cfg(feature = "dhcpv4-hostname")]
     hostname: *mut HostnameResources,
+    cooperative_starts_with_ingress: bool,
 }
 
 fn _assert_covariant<'a, 'b: 'a>(x: Stack<'b>) -> Stack<'a> {
@@ -346,6 +338,7 @@ pub fn new<'d, D: Driver, const SOCK: usize>(
             cx: None,
             medium,
             tx_exhausted: false,
+            tx_tokens_issued: 0,
         },
         instant_to_smoltcp(Instant::now()),
     );
@@ -390,6 +383,7 @@ pub fn new<'d, D: Driver, const SOCK: usize>(
         dns_waker: WakerRegistration::new(),
         #[cfg(feature = "dhcpv4-hostname")]
         hostname: &mut resources.hostname,
+        cooperative_starts_with_ingress: true,
     };
 
     #[cfg(feature = "proto-ipv4")]
@@ -898,31 +892,62 @@ impl Inner {
             inner: driver,
             medium,
             tx_exhausted: false,
+            tx_tokens_issued: 0,
         };
-        let mut cooperative_worked = false;
+        let mut cooperative_state = None;
         if let Some(config) = cooperative {
             self.iface.poll_maintenance(timestamp);
             let started = Instant::now();
-            loop {
-                let ingress = self
-                    .iface
-                    .poll_ingress_single(timestamp, &mut smoldev, &mut self.sockets);
-                let egress = self.iface.poll_egress(timestamp, &mut smoldev, &mut self.sockets);
-                cooperative_worked = ingress != PollIngressSingleResult::None || egress != PollResult::None;
-                // A failed transmit has registered this task's waker with the
-                // driver. Return to the executor immediately so the radio task
-                // can reclaim TX descriptors, and rely on that credit-return
-                // wake instead of keeping an RX-busy network task runnable.
-                if !cooperative_worked || smoldev.tx_exhausted || started.elapsed() >= config.max_poll_duration {
-                    break;
+            let starts_with_ingress = take_start_direction(&mut self.cooperative_starts_with_ingress);
+            let mut state = CooperativePollState::new(starts_with_ingress);
+            let mut time_exhausted = false;
+            while state.can_poll() && !time_exhausted {
+                for ingress_turn in [starts_with_ingress, !starts_with_ingress] {
+                    if ingress_turn {
+                        for _ in 0..DIRECTION_QUANTUM {
+                            if !state.can_poll_ingress() {
+                                break;
+                            }
+                            let ingress = self
+                                .iface
+                                .poll_ingress_single(timestamp, &mut smoldev, &mut self.sockets);
+                            state.record_ingress(ingress);
+                            time_exhausted = started.elapsed() >= config.max_poll_duration;
+                            if time_exhausted {
+                                break;
+                            }
+                        }
+                    } else {
+                        for _ in 0..DIRECTION_QUANTUM {
+                            if !state.can_poll_egress() {
+                                break;
+                            }
+                            let issued_before = smoldev.tx_tokens_issued;
+                            let egress = self.iface.poll_egress(timestamp, &mut smoldev, &mut self.sockets);
+                            let issued = smoldev.tx_tokens_issued.saturating_sub(issued_before);
+                            let blocked = smoldev.take_tx_exhausted();
+                            state.record_egress(egress, issued, blocked);
+                            time_exhausted = started.elapsed() >= config.max_poll_duration;
+                            if time_exhausted {
+                                break;
+                            }
+                        }
+                    }
+                    if time_exhausted {
+                        break;
+                    }
                 }
             }
+            #[cfg(feature = "cooperative-scheduler-telemetry")]
+            config.observe(state.report(started.elapsed().as_micros(), time_exhausted));
+            let self_wake = state.should_self_wake(time_exhausted);
+            cooperative_state = Some((state.egress_blocked, self_wake));
         } else {
             self.iface.poll(timestamp, &mut smoldev, &mut self.sockets);
         }
-        let tx_exhausted = smoldev.tx_exhausted;
+        let (tx_exhausted, cooperative_self_wake) = cooperative_state.unwrap_or((smoldev.tx_exhausted, false));
         drop(smoldev);
-        if cooperative_worked && !tx_exhausted {
+        if cooperative_self_wake {
             cx.waker().wake_by_ref();
         }
 
@@ -1036,10 +1061,10 @@ impl<'d, D: Driver> Runner<'d, D> {
 
     /// Run the network stack with bounded, directionally fair polling.
     ///
-    /// Each round processes at most one ingress packet before polling egress.
-    /// Rounds repeat only until the configured residence limit, then a
-    /// self-wake returns ownership to the cooperative executor before work
-    /// continues.
+    /// Each round processes symmetric four-operation ingress and egress
+    /// quanta, alternating the first direction between executor polls. Work
+    /// is additionally bounded to 32 operations per direction and by the
+    /// configured residence limit.
     pub async fn run_cooperative(&mut self, config: CooperativeConfig) -> ! {
         poll_fn(|cx| {
             self.stack
