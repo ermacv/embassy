@@ -67,7 +67,7 @@ use crate::time::{instant_from_smoltcp, instant_to_smoltcp};
 pub use cooperative::CooperativeConfig;
 #[cfg(feature = "cooperative-scheduler-telemetry")]
 pub use cooperative::{CooperativePollExit, CooperativePollReport};
-use cooperative::{CooperativePollState, DIRECTION_QUANTUM, take_start_direction};
+use cooperative::{CooperativePollState, take_start_direction};
 
 const LOCAL_PORT_MIN: u16 = 1025;
 const LOCAL_PORT_MAX: u16 = 65535;
@@ -309,6 +309,7 @@ pub(crate) struct Inner {
     #[cfg(feature = "dhcpv4-hostname")]
     hostname: *mut HostnameResources,
     cooperative_starts_with_ingress: bool,
+    cooperative_force_ingress: bool,
 }
 
 fn _assert_covariant<'a, 'b: 'a>(x: Stack<'b>) -> Stack<'a> {
@@ -338,6 +339,8 @@ pub fn new<'d, D: Driver, const SOCK: usize>(
             cx: None,
             medium,
             tx_exhausted: false,
+            cooperative_tx_budget: None,
+            cooperative_tx_budget_exhausted: false,
             tx_tokens_issued: 0,
         },
         instant_to_smoltcp(Instant::now()),
@@ -384,6 +387,7 @@ pub fn new<'d, D: Driver, const SOCK: usize>(
         #[cfg(feature = "dhcpv4-hostname")]
         hostname: &mut resources.hostname,
         cooperative_starts_with_ingress: true,
+        cooperative_force_ingress: false,
     };
 
     #[cfg(feature = "proto-ipv4")]
@@ -892,56 +896,55 @@ impl Inner {
             inner: driver,
             medium,
             tx_exhausted: false,
+            cooperative_tx_budget: cooperative.map(|config| config.egress_frames),
+            cooperative_tx_budget_exhausted: false,
             tx_tokens_issued: 0,
         };
         let mut cooperative_state = None;
         if let Some(config) = cooperative {
             self.iface.poll_maintenance(timestamp);
             let started = Instant::now();
-            let starts_with_ingress = take_start_direction(&mut self.cooperative_starts_with_ingress);
-            let mut state = CooperativePollState::new(starts_with_ingress);
+            let starts_with_ingress = take_start_direction(
+                &mut self.cooperative_starts_with_ingress,
+                &mut self.cooperative_force_ingress,
+            );
+            let mut state = CooperativePollState::new(config, starts_with_ingress);
             let mut time_exhausted = false;
-            while state.can_poll() && !time_exhausted {
-                for ingress_turn in [starts_with_ingress, !starts_with_ingress] {
-                    if ingress_turn {
-                        for _ in 0..DIRECTION_QUANTUM {
-                            if !state.can_poll_ingress() {
-                                break;
-                            }
-                            let ingress = self
-                                .iface
-                                .poll_ingress_single(timestamp, &mut smoldev, &mut self.sockets);
-                            state.record_ingress(ingress);
-                            time_exhausted = started.elapsed() >= config.max_poll_duration;
-                            if time_exhausted {
-                                break;
-                            }
-                        }
-                    } else {
-                        for _ in 0..DIRECTION_QUANTUM {
-                            if !state.can_poll_egress() {
-                                break;
-                            }
-                            let issued_before = smoldev.tx_tokens_issued;
-                            let egress = self.iface.poll_egress(timestamp, &mut smoldev, &mut self.sockets);
-                            let issued = smoldev.tx_tokens_issued.saturating_sub(issued_before);
-                            let blocked = smoldev.take_tx_exhausted();
-                            state.record_egress(egress, issued, blocked);
-                            time_exhausted = started.elapsed() >= config.max_poll_duration;
-                            if time_exhausted {
-                                break;
-                            }
+            for ingress_turn in [starts_with_ingress, !starts_with_ingress] {
+                if ingress_turn {
+                    while state.can_poll_ingress() && !time_exhausted {
+                        let ingress = self
+                            .iface
+                            .poll_ingress_single(timestamp, &mut smoldev, &mut self.sockets);
+                        state.record_ingress(ingress);
+                        time_exhausted = started.elapsed() >= config.max_poll_duration;
+                    }
+                } else {
+                    while state.can_poll_egress() && !time_exhausted {
+                        let issued_before = smoldev.tx_tokens_issued;
+                        let egress = self.iface.poll_egress(timestamp, &mut smoldev, &mut self.sockets);
+                        let issued = smoldev.tx_tokens_issued.saturating_sub(issued_before);
+                        let hardware_blocked = smoldev.take_tx_exhausted();
+                        let software_blocked = smoldev.take_cooperative_tx_budget_exhausted();
+                        state.record_egress(egress, issued, hardware_blocked, software_blocked);
+                        time_exhausted = started.elapsed() >= config.max_poll_duration;
+                        if hardware_blocked {
+                            // Returning from this task poll is the credit path:
+                            // the radio owner must run before network ingress is
+                            // allowed to continue on a saturated single core.
+                            break;
                         }
                     }
-                    if time_exhausted {
-                        break;
-                    }
+                }
+                if time_exhausted || state.egress_hardware_blocked {
+                    break;
                 }
             }
             #[cfg(feature = "cooperative-scheduler-telemetry")]
             config.observe(state.report(started.elapsed().as_micros(), time_exhausted));
             let self_wake = state.should_self_wake(time_exhausted);
-            cooperative_state = Some((state.egress_blocked, self_wake));
+            self.cooperative_force_ingress = state.needs_forced_ingress_followup();
+            cooperative_state = Some((state.egress_hardware_blocked, self_wake));
         } else {
             self.iface.poll(timestamp, &mut smoldev, &mut self.sockets);
         }
@@ -1061,10 +1064,10 @@ impl<'d, D: Driver> Runner<'d, D> {
 
     /// Run the network stack with bounded, directionally fair polling.
     ///
-    /// Each round processes symmetric four-operation ingress and egress
-    /// quanta, alternating the first direction between executor polls. Work
-    /// is additionally bounded to 32 operations per direction and by the
-    /// configured residence limit.
+    /// Each executor poll processes at most the configured ingress frames and
+    /// actually issued egress tokens. A driver-credit stop returns ownership
+    /// immediately so the hardware owner can run before an ingress-first
+    /// follow-up turn.
     pub async fn run_cooperative(&mut self, config: CooperativeConfig) -> ! {
         poll_fn(|cx| {
             self.stack

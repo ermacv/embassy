@@ -13,12 +13,18 @@ where
     pub inner: &'d mut T,
     pub medium: Medium,
     pub tx_exhausted: bool,
+    pub cooperative_tx_budget: Option<u8>,
+    pub cooperative_tx_budget_exhausted: bool,
     pub tx_tokens_issued: u32,
 }
 
 impl<T: Driver> DriverAdapter<'_, '_, T> {
     pub fn take_tx_exhausted(&mut self) -> bool {
         core::mem::replace(&mut self.tx_exhausted, false)
+    }
+
+    pub fn take_cooperative_tx_budget_exhausted(&mut self) -> bool {
+        core::mem::replace(&mut self.cooperative_tx_budget_exhausted, false)
     }
 }
 
@@ -43,10 +49,18 @@ where
 
     /// Construct a transmit token.
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
+        if self.cooperative_tx_budget == Some(0) {
+            self.cooperative_tx_budget_exhausted = true;
+            return None;
+        }
+
         let token = self.inner.transmit(unwrap!(self.cx.as_deref_mut())).map(TxTokenAdapter);
 
         if token.is_some() {
             self.tx_tokens_issued = self.tx_tokens_issued.saturating_add(1);
+            if let Some(remaining) = &mut self.cooperative_tx_budget {
+                *remaining -= 1;
+            }
         } else {
             self.tx_exhausted = true;
         }
