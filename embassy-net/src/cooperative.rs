@@ -56,7 +56,7 @@ pub enum CooperativePollExit {
     WorkBudget,
     /// The residence deadline was reached.
     TimeBudget,
-    /// Application egress is waiting for a driver TX credit and ingress is drained.
+    /// Application egress is waiting for a driver TX credit.
     EgressCredit,
 }
 
@@ -116,7 +116,7 @@ impl CooperativePollState {
     }
 
     pub(crate) fn can_poll_ingress(&self) -> bool {
-        !self.ingress_drained && self.ingress_packets < INGRESS_LIMIT
+        !self.egress_blocked && !self.ingress_drained && self.ingress_packets < INGRESS_LIMIT
     }
 
     pub(crate) fn can_poll_egress(&self) -> bool {
@@ -150,6 +150,13 @@ impl CooperativePollState {
     }
 
     pub(crate) fn should_self_wake(&self, time_exhausted: bool) -> bool {
+        // A failed transmit registered this task's waker with the driver.
+        // Yield to the executor so the radio owner can return a TX credit;
+        // self-waking here would keep an RX-busy network task runnable ahead
+        // of that owner on a cooperative single-core executor.
+        if self.egress_blocked {
+            return false;
+        }
         if time_exhausted {
             return self.can_poll_ingress() || self.can_poll_egress();
         }
@@ -166,7 +173,7 @@ impl CooperativePollState {
             CooperativePollExit::TimeBudget
         } else if ingress_budget_exhausted || egress_budget_exhausted {
             CooperativePollExit::WorkBudget
-        } else if self.egress_blocked && self.ingress_drained {
+        } else if self.egress_blocked {
             CooperativePollExit::EgressCredit
         } else {
             CooperativePollExit::Drained
@@ -191,12 +198,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn egress_credit_exhaustion_does_not_suppress_ingress() {
+    fn egress_credit_exhaustion_yields_before_more_ingress() {
         let mut state = CooperativePollState::new(true);
         state.record_egress(PollResult::None, 0, true);
         assert!(state.egress_blocked);
         assert!(!state.can_poll_egress());
-        assert!(state.can_poll_ingress());
+        assert!(!state.can_poll_ingress());
+        assert!(!state.should_self_wake(false));
     }
 
     #[test]
