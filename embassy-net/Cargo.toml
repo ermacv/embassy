@@ -115,7 +115,7 @@ alloc = ["smoltcp/alloc"]
 defmt = { version = "1.0.1", optional = true }
 log = { version = "0.4.14", optional = true }
 
-smoltcp = { git = "https://github.com/ermacv/smoltcp", rev = "3269d275366670ae283d0eb9d2a1bc0cf2524f0c", default-features = false, features = [
+smoltcp = { git = "https://github.com/ermacv/smoltcp", rev = "537b05449fcd896cc66a80c0a16e4699b4a2c57e", default-features = false, features = [
   "socket",
   "async",
 ] }
