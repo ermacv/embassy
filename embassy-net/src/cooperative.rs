@@ -116,7 +116,7 @@ impl CooperativePollState {
     }
 
     pub(crate) fn can_poll_ingress(&self) -> bool {
-        !self.egress_blocked && !self.ingress_drained && self.ingress_packets < INGRESS_LIMIT
+        !self.ingress_drained && self.ingress_packets < INGRESS_LIMIT
     }
 
     pub(crate) fn can_poll_egress(&self) -> bool {
@@ -150,13 +150,6 @@ impl CooperativePollState {
     }
 
     pub(crate) fn should_self_wake(&self, time_exhausted: bool) -> bool {
-        // A failed transmit registered this task's waker with the driver.
-        // Yield to the executor so the radio owner can return a TX credit;
-        // self-waking here would keep an RX-busy network task runnable ahead
-        // of that owner on a cooperative single-core executor.
-        if self.egress_blocked {
-            return false;
-        }
         if time_exhausted {
             return self.can_poll_ingress() || self.can_poll_egress();
         }
@@ -198,13 +191,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn egress_credit_exhaustion_yields_before_more_ingress() {
+    fn egress_credit_exhaustion_does_not_block_reserved_ingress_credit() {
         let mut state = CooperativePollState::new(true);
         state.record_egress(PollResult::None, 0, true);
         assert!(state.egress_blocked);
         assert!(!state.can_poll_egress());
-        assert!(!state.can_poll_ingress());
+        assert!(state.can_poll_ingress());
         assert!(!state.should_self_wake(false));
+    }
+
+    #[test]
+    fn ingress_budget_self_wakes_while_application_egress_waits_for_credit() {
+        let mut state = CooperativePollState::new(true);
+        state.record_egress(PollResult::None, 0, true);
+        for _ in 0..INGRESS_LIMIT {
+            state.record_ingress(PollIngressSingleResult::PacketProcessed);
+        }
+        assert!(state.should_self_wake(false));
     }
 
     #[test]
