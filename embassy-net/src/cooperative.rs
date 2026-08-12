@@ -94,11 +94,14 @@ pub(crate) struct CooperativePollState {
     pub(crate) ingress_drained: bool,
     pub(crate) egress_drained: bool,
     pub(crate) egress_blocked: bool,
+    #[cfg(feature = "cooperative-scheduler-telemetry")]
     pub(crate) started_with_ingress: bool,
 }
 
 impl CooperativePollState {
     pub(crate) const fn new(started_with_ingress: bool) -> Self {
+        #[cfg(not(feature = "cooperative-scheduler-telemetry"))]
+        let _ = started_with_ingress;
         Self {
             ingress_calls: 0,
             ingress_packets: 0,
@@ -107,6 +110,7 @@ impl CooperativePollState {
             ingress_drained: false,
             egress_drained: false,
             egress_blocked: false,
+            #[cfg(feature = "cooperative-scheduler-telemetry")]
             started_with_ingress,
         }
     }
