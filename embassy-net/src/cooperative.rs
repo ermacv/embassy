@@ -1,7 +1,7 @@
 use embassy_time::Duration;
 use smoltcp::iface::{PollIngressSingleResult, PollResult};
 
-pub(crate) const DIRECTION_QUANTUM: u8 = 1;
+pub(crate) const DIRECTION_QUANTUM: u8 = 4;
 pub(crate) const INGRESS_LIMIT: u8 = 32;
 pub(crate) const EGRESS_LIMIT: u8 = 32;
 
@@ -21,8 +21,8 @@ pub struct CooperativeConfig {
 }
 
 impl CooperativeConfig {
-    /// Create a strictly interleaved runner policy capped at 32 ingress
-    /// packets and 32 egress passes per executor poll.
+    /// Create a symmetric 4/4 runner policy capped at 32 ingress packets and
+    /// 32 egress passes per executor poll.
     pub const fn new(max_poll_duration: Duration) -> Self {
         Self {
             max_poll_duration,
