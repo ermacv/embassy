@@ -53,10 +53,10 @@ target = "thumbv7em-none-eabi"
 features = ["defmt", "tcp", "udp", "raw", "dns", "icmp", "dhcpv4", "proto-ipv6", "medium-ethernet", "medium-ip", "medium-ieee802154", "multicast", "dhcpv4-hostname"]
 
 [features]
-## Place the measured smoltcp packet emit and egress path in semantic hot
-## sections. The final firmware linker decides which executable memory backs
-## those sections.
-_perf-hotpath = ["smoltcp/_perf-hotpath-emit"]
+## Place the measured smoltcp packet emit and UDP ingress paths in semantic
+## hot sections. The final firmware linker decides which executable memory
+## backs those sections.
+_perf-hotpath = ["smoltcp/_perf-hotpath-emit", "smoltcp/_perf-hotpath-ingress"]
 
 ## Enable defmt
 defmt = ["dep:defmt", "smoltcp/defmt", "embassy-net-driver/defmt", "embassy-time/defmt", "heapless/defmt", "defmt?/ip_in_core"]
@@ -112,7 +112,7 @@ alloc = ["smoltcp/alloc"]
 defmt = { version = "1.0.1", optional = true }
 log = { version = "0.4.14", optional = true }
 
-smoltcp = { git = "https://github.com/ermacv/smoltcp", rev = "537b05449fcd896cc66a80c0a16e4699b4a2c57e", default-features = false, features = [
+smoltcp = { git = "https://github.com/ermacv/smoltcp", rev = "3269d275366670ae283d0eb9d2a1bc0cf2524f0c", default-features = false, features = [
   "socket",
   "async",
 ] }
