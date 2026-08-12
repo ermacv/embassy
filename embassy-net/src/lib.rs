@@ -909,7 +909,11 @@ impl Inner {
                     .poll_ingress_single(timestamp, &mut smoldev, &mut self.sockets);
                 let egress = self.iface.poll_egress(timestamp, &mut smoldev, &mut self.sockets);
                 cooperative_worked = ingress != PollIngressSingleResult::None || egress != PollResult::None;
-                if !cooperative_worked || started.elapsed() >= config.max_poll_duration {
+                // A failed transmit has registered this task's waker with the
+                // driver. Return to the executor immediately so the radio task
+                // can reclaim TX descriptors, and rely on that credit-return
+                // wake instead of keeping an RX-busy network task runnable.
+                if !cooperative_worked || smoldev.tx_exhausted || started.elapsed() >= config.max_poll_duration {
                     break;
                 }
             }
@@ -918,7 +922,7 @@ impl Inner {
         }
         let tx_exhausted = smoldev.tx_exhausted;
         drop(smoldev);
-        if cooperative_worked {
+        if cooperative_worked && !tx_exhausted {
             cx.waker().wake_by_ref();
         }
 
