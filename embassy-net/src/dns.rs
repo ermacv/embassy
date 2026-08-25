@@ -5,9 +5,8 @@
 //! not using `embedded-nal-async`.
 
 use heapless::Vec;
-pub use xarxa::socket::dns::{DnsQuery, Socket};
-pub(crate) use xarxa::socket::dns::{GetQueryResultError, StartQueryError};
-pub use xarxa::wire::{DnsQueryType, IpAddress};
+pub(crate) use xarxa::dns::{GetQueryResultError, StartQueryError};
+pub use xarxa::wire::{DnsType as DnsQueryType, IpAddress};
 
 use crate::Stack;
 

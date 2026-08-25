@@ -10,14 +10,14 @@
 #[cfg(not(any(feature = "proto-ipv4", feature = "proto-ipv6")))]
 compile_error!("You must enable at least one of the following features: proto-ipv4, proto-ipv6");
 
+#[cfg(not(any(feature = "medium-ethernet", feature = "medium-ip", feature = "medium-ieee802154")))]
+compile_error!("You must enable at least one of the following features: medium-ethernet, medium-ip, medium-ieee802154");
+
 // This mod MUST go first, so that the others see its macros.
 pub(crate) mod fmt;
 
 #[cfg(feature = "dns")]
 pub mod dns;
-mod driver_util;
-#[cfg(feature = "icmp")]
-pub mod icmp;
 #[cfg(feature = "raw")]
 pub mod raw;
 #[cfg(feature = "tcp")]
@@ -25,7 +25,6 @@ pub mod tcp;
 mod time;
 #[cfg(feature = "udp")]
 pub mod udp;
-pub mod vlan;
 
 use core::cell::RefCell;
 use core::future::{Future, poll_fn};
@@ -34,9 +33,12 @@ use core::pin::pin;
 use core::task::{Context, Poll};
 
 pub use embassy_net_driver as driver;
-#[cfg(feature = "packetmeta-timestamp")]
-use embassy_net_driver::TxTimestamp;
 use embassy_net_driver::{Driver, LinkState};
+pub use embassy_net_driver::{
+    HardwareAddress, PacketBuf, PacketBufAllocator, PacketMeta, PacketPool, PacketPoolStorage,
+};
+#[cfg(feature = "packetmeta-timestamp")]
+pub use embassy_net_driver::{Timestamp, TxTimestamp};
 #[cfg(feature = "packetmeta-timestamp")]
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 #[cfg(feature = "packetmeta-timestamp")]
@@ -44,41 +46,33 @@ use embassy_sync::channel::Channel;
 use embassy_sync::waitqueue::WakerRegistration;
 use embassy_time::{Instant, Timer};
 use heapless::Vec;
+/// The underlying network stack.
+///
+/// Re-exported for access to the wire types and to the parts of the API that
+/// `embassy-net` does not wrap.
+pub use xarxa;
 #[cfg(feature = "dns")]
 pub use xarxa::config::DNS_MAX_SERVER_COUNT;
 #[cfg(feature = "multicast")]
 pub use xarxa::iface::MulticastError;
-#[cfg(any(feature = "dns", feature = "dhcpv4"))]
-use xarxa::iface::SocketHandle;
-use xarxa::iface::{Interface, SocketSet, SocketStorage};
-use xarxa::phy::Medium;
-#[cfg(feature = "dhcpv4")]
-use xarxa::socket::dhcpv4::{self, RetryConfig};
+use xarxa::iface::{AddrOrigin, IfaceHandle};
+use xarxa::route::RouteOrigin;
 #[cfg(feature = "medium-ethernet")]
 pub use xarxa::wire::EthernetAddress;
-#[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154", feature = "medium-ip"))]
-pub use xarxa::wire::HardwareAddress;
-#[cfg(any(feature = "udp", feature = "tcp"))]
-pub use xarxa::wire::IpListenEndpoint;
 #[cfg(feature = "medium-ieee802154")]
-pub use xarxa::wire::{Ieee802154Address, Ieee802154Frame};
-pub use xarxa::wire::{IpAddress, IpCidr, IpEndpoint};
+pub use xarxa::wire::Ieee802154Address;
+pub use xarxa::wire::{IpAddress, IpCidr, IpEndpoint, IpListenEndpoint};
 #[cfg(feature = "proto-ipv4")]
 pub use xarxa::wire::{Ipv4Address, Ipv4Cidr};
 #[cfg(feature = "proto-ipv6")]
 pub use xarxa::wire::{Ipv6Address, Ipv6Cidr};
 
-use crate::driver_util::DriverAdapter;
 use crate::time::{instant_from_xarxa, instant_to_xarxa};
 
-const LOCAL_PORT_MIN: u16 = 1025;
-const LOCAL_PORT_MAX: u16 = 65535;
-#[cfg(feature = "dns")]
-const MAX_QUERIES: usize = 4;
-#[cfg(feature = "dhcpv4-ntp")]
-const DHCP_RX_BUFFER_SIZE: usize = 576;
 #[cfg(feature = "dhcpv4-hostname")]
 const MAX_HOSTNAME_LEN: usize = 32;
+/// Most DNS servers kept per IP version in a static configuration.
+const MAX_DNS_SERVERS: usize = 3;
 
 /// Error returned by `try_*` socket methods.
 ///
@@ -95,41 +89,39 @@ pub enum TryError<T> {
 }
 
 /// Memory resources needed for a network stack.
-pub struct StackResources<const SOCK: usize> {
-    sockets: MaybeUninit<[SocketStorage<'static>; SOCK]>,
+///
+/// `D` is the driver type. The stack holds the driver in here, so the
+/// resources must outlive the stack: put them in a `static` (with
+/// `StaticCell`), or declare them before the stack.
+///
+/// Socket storage is not here: the stack has a fixed number of socket slots per
+/// type, set by the `*-socket-count-N` features of `xarxa`. Packet payload
+/// storage is supplied separately to [`new`] as a [`PacketBufAllocator`], so
+/// applications can place it in the memory domain appropriate to the system.
+pub struct StackResources<D> {
     inner: MaybeUninit<RefCell<Inner>>,
-    #[cfg(feature = "dns")]
-    queries: MaybeUninit<[Option<dns::DnsQuery>; MAX_QUERIES]>,
+    adapter: MaybeUninit<DriverAdapter<D>>,
     #[cfg(feature = "dhcpv4-hostname")]
     hostname: HostnameResources,
-    // Retains the raw DHCP reply so options not parsed by xarxa (NTP servers, option 42) can be
-    // read out. 576 is the minimum DHCP message size every server must respect (RFC 2131); an
-    // undersized buffer never corrupts the IP configuration, it only drops the extra options.
-    #[cfg(feature = "dhcpv4-ntp")]
-    dhcp_rx_buffer: MaybeUninit<[u8; DHCP_RX_BUFFER_SIZE]>,
 }
 
 #[cfg(feature = "dhcpv4-hostname")]
 struct HostnameResources {
-    option: MaybeUninit<xarxa::wire::DhcpOption<'static>>,
+    option: MaybeUninit<[xarxa::wire::DhcpOption<'static>; 1]>,
     data: MaybeUninit<[u8; MAX_HOSTNAME_LEN]>,
 }
 
-impl<const SOCK: usize> StackResources<SOCK> {
+impl<D> StackResources<D> {
     /// Create a new set of stack resources.
     pub const fn new() -> Self {
         Self {
-            sockets: MaybeUninit::uninit(),
             inner: MaybeUninit::uninit(),
-            #[cfg(feature = "dns")]
-            queries: MaybeUninit::uninit(),
+            adapter: MaybeUninit::uninit(),
             #[cfg(feature = "dhcpv4-hostname")]
             hostname: HostnameResources {
                 option: MaybeUninit::uninit(),
                 data: MaybeUninit::uninit(),
             },
-            #[cfg(feature = "dhcpv4-ntp")]
-            dhcp_rx_buffer: MaybeUninit::uninit(),
         }
     }
 }
@@ -144,10 +136,7 @@ pub struct StaticConfigV4 {
     /// Default gateway.
     pub gateway: Option<Ipv4Address>,
     /// DNS servers.
-    pub dns_servers: Vec<Ipv4Address, 3>,
-    /// NTP servers (DHCP option 42).
-    #[cfg(feature = "dhcpv4-ntp")]
-    pub ntp_servers: Vec<Ipv4Address, 4>,
+    pub dns_servers: Vec<Ipv4Address, MAX_DNS_SERVERS>,
 }
 
 /// Static IPv6 address configuration
@@ -160,7 +149,7 @@ pub struct StaticConfigV6 {
     /// Default gateway.
     pub gateway: Option<Ipv6Address>,
     /// DNS servers.
-    pub dns_servers: Vec<Ipv6Address, 3>,
+    pub dns_servers: Vec<Ipv6Address, MAX_DNS_SERVERS>,
 }
 
 /// DHCP configuration.
@@ -174,16 +163,10 @@ pub struct DhcpConfig {
     /// If not set, the lease duration specified by the server will be used.
     /// If set, the lease duration will be capped at this value.
     pub max_lease_duration: Option<embassy_time::Duration>,
-    /// Retry configuration.
-    pub retry_config: RetryConfig,
     /// Ignore NAKs from DHCP servers.
     ///
     /// This is not compliant with the DHCP RFCs, since theoretically we must stop using the assigned IP when receiving a NAK. This can increase reliability on broken networks with buggy routers or rogue DHCP servers, however.
     pub ignore_naks: bool,
-    /// Server port. This is almost always 67. Do not change unless you know what you're doing.
-    pub server_port: u16,
-    /// Client port. This is almost always 68. Do not change unless you know what you're doing.
-    pub client_port: u16,
     /// Our hostname. This will be sent to the DHCP server as Option 12.
     #[cfg(feature = "dhcpv4-hostname")]
     pub hostname: Option<heapless::String<MAX_HOSTNAME_LEN>>,
@@ -194,10 +177,7 @@ impl Default for DhcpConfig {
     fn default() -> Self {
         Self {
             max_lease_duration: Default::default(),
-            retry_config: Default::default(),
             ignore_naks: Default::default(),
-            server_port: xarxa::wire::DHCP_SERVER_PORT,
-            client_port: xarxa::wire::DHCP_CLIENT_PORT,
             #[cfg(feature = "dhcpv4-hostname")]
             hostname: None,
         }
@@ -298,8 +278,7 @@ pub enum ConfigV6 {
 /// Network stack runner.
 ///
 /// You must call [`Runner::run()`] in a background task for the network stack to work.
-pub struct Runner<'d, D: Driver> {
-    driver: D,
+pub struct Runner<'d> {
     stack: Stack<'d>,
 }
 
@@ -312,32 +291,81 @@ pub struct Stack<'d> {
     inner: &'d RefCell<Inner>,
 }
 
+/// The `xarxa` interface over the `embassy-net` driver.
+///
+/// The `xarxa` interface over the `embassy-net` driver.
+///
+/// The adapter owns the concrete driver and is lent to Xarxa for the complete
+/// stack lifetime. Therefore packet calls need neither a second dynamic
+/// dispatch nor a runtime borrow. Runner wake registration goes through the
+/// same Xarxa-owned adapter instead of keeping a second path to the driver.
+struct DriverAdapter<D> {
+    inner: D,
+}
+
+impl<D: Driver> xarxa::driver::Driver for DriverAdapter<D> {
+    fn capabilities(&self) -> driver::Capabilities {
+        self.inner.capabilities()
+    }
+
+    fn hardware_address(&self) -> HardwareAddress {
+        self.inner.hardware_address()
+    }
+
+    fn link_state(&mut self) -> LinkState {
+        self.inner.link_state()
+    }
+
+    fn register_waker(&mut self, waker: &core::task::Waker) -> Result<(), xarxa::driver::NotSupported> {
+        self.inner.register_waker(waker);
+        Ok(())
+    }
+
+    fn receive(&mut self) -> Option<PacketBuf> {
+        let buf = self.inner.receive();
+        #[cfg(feature = "packet-trace")]
+        if let Some(buf) = &buf {
+            trace!("embassy device rx: {:02x}", &buf[..]);
+        }
+        buf
+    }
+
+    fn can_transmit(&mut self) -> bool {
+        self.inner.can_transmit()
+    }
+
+    fn transmit(&mut self, buf: PacketBuf) -> Result<(), PacketBuf> {
+        #[cfg(feature = "packet-trace")]
+        trace!("embassy device tx: {:02x}", &buf[..]);
+        self.inner.transmit(buf)
+    }
+
+    #[cfg(feature = "packetmeta-timestamp")]
+    fn poll_tx_timestamp(&mut self) -> Option<TxTimestamp> {
+        self.inner.poll_tx_timestamp()
+    }
+}
+
 pub(crate) struct Inner {
-    pub(crate) sockets: SocketSet<'static>, // Lifetime type-erased.
-    pub(crate) iface: Interface,
+    pub(crate) stack: xarxa::Stack<'static>, // Lifetime type-erased.
+    pub(crate) iface: IfaceHandle,
     /// Waker used for triggering polls.
     pub(crate) waker: WakerRegistration,
     /// Waker used for waiting for link up or config up.
     state_waker: WakerRegistration,
-    hardware_address: HardwareAddress,
-    next_local_port: u16,
     link_up: bool,
+    /// The interface's configuration generation the last time we looked.
+    config_generation: u32,
     #[cfg(feature = "proto-ipv4")]
-    static_v4: Option<StaticConfigV4>,
+    config_v4: ConfigV4,
     #[cfg(feature = "proto-ipv6")]
-    static_v6: Option<StaticConfigV6>,
-    #[cfg(feature = "slaac")]
-    slaac: bool,
-    #[cfg(feature = "dhcpv4")]
-    dhcp_socket: Option<SocketHandle>,
+    config_v6: ConfigV6,
     #[cfg(feature = "dns")]
-    dns_socket: SocketHandle,
+    pub(crate) dns: xarxa::dns::DnsClient,
     #[cfg(feature = "dns")]
-    dns_waker: WakerRegistration,
+    pub(crate) dns_waker: WakerRegistration,
     #[cfg(feature = "dhcpv4-hostname")]
     hostname: *mut HostnameResources,
-    #[cfg(feature = "dhcpv4-ntp")]
-    dhcp_rx_buffer: *mut [u8],
     #[cfg(feature = "packetmeta-timestamp")]
     timestamps: Channel<NoopRawMutex, TxTimestamp, 5>,
 }
@@ -347,74 +375,50 @@ fn _assert_covariant<'a, 'b: 'a>(x: Stack<'b>) -> Stack<'a> {
 }
 
 /// Create a new network stack.
-pub fn new<'d, D: Driver, const SOCK: usize>(
-    mut driver: D,
+///
+/// The driver is moved into `resources`, and never dropped: the stack lives
+/// for the rest of the program. `packet_allocator` supplies every packet the
+/// stack itself creates. Packets received from the driver keep their own pool
+/// origin, which may use a different capacity and memory placement.
+pub fn new<'d, D: Driver + 'd>(
+    driver: D,
     config: Config,
-    resources: &'d mut StackResources<SOCK>,
+    resources: &'d mut StackResources<D>,
     random_seed: u64,
-) -> (Stack<'d>, Runner<'d, D>) {
-    let (hardware_address, medium) = to_xarxa_hardware_address(driver.hardware_address());
-    let mut iface_cfg = xarxa::iface::Config::new(hardware_address);
-    iface_cfg.random_seed = random_seed;
-    #[cfg(feature = "slaac")]
-    {
-        iface_cfg.slaac = matches!(config.ipv6, ConfigV6::Slaac);
-    }
+    packet_allocator: PacketBufAllocator,
+) -> (Stack<'d>, Runner<'d>) {
+    let adapter: &'d mut DriverAdapter<D> = resources.adapter.write(DriverAdapter { inner: driver });
 
-    #[allow(unused_mut)]
-    let mut iface = Interface::new(
-        iface_cfg,
-        &mut DriverAdapter {
-            inner: &mut driver,
-            cx: None,
-            medium,
-            tx_exhausted: false,
-        },
-        instant_to_xarxa(Instant::now()),
-    );
+    // `Inner` has no lifetime parameters, so the references it keeps are
+    // lifetime type-erased inside its `stack` field.
+    // safety: the adapter and `Inner` both live in `resources`, which `new()`
+    // borrows for `'d`; nothing reaches either value past that borrow.
+    let adapter: &'d mut (dyn xarxa::driver::Driver + 'd) = adapter;
+    let adapter: &'static mut (dyn xarxa::driver::Driver + 'static) = unsafe { core::mem::transmute(adapter) };
 
-    unsafe fn transmute_slice<T>(x: &mut [T]) -> &'static mut [T] {
-        core::mem::transmute(x)
-    }
-
-    let sockets = resources.sockets.write([SocketStorage::EMPTY; SOCK]);
-    #[allow(unused_mut)]
-    let mut sockets: SocketSet<'static> = SocketSet::new(unsafe { transmute_slice(sockets) });
-
-    let next_local_port = (random_seed % (LOCAL_PORT_MAX - LOCAL_PORT_MIN) as u64) as u16 + LOCAL_PORT_MIN;
+    let mut stack = xarxa::Stack::new(random_seed, packet_allocator);
+    let iface = unwrap!(stack.add_iface_borrowed(adapter).ok());
 
     #[cfg(feature = "dns")]
-    let dns_socket = sockets.add(dns::Socket::new(
-        &[],
-        managed::ManagedSlice::Borrowed(unsafe {
-            transmute_slice(resources.queries.write([const { None }; MAX_QUERIES]))
-        }),
-    ));
+    let dns = unwrap!(xarxa::dns::DnsClient::new(&mut stack, &[]).ok());
 
     let mut inner = Inner {
-        sockets,
+        stack,
         iface,
         waker: WakerRegistration::new(),
         state_waker: WakerRegistration::new(),
-        next_local_port,
-        hardware_address,
         link_up: false,
+        config_generation: 0,
         #[cfg(feature = "proto-ipv4")]
-        static_v4: None,
+        config_v4: ConfigV4::None,
         #[cfg(feature = "proto-ipv6")]
-        static_v6: None,
-        #[cfg(feature = "slaac")]
-        slaac: false,
-        #[cfg(feature = "dhcpv4")]
-        dhcp_socket: None,
+        config_v6: ConfigV6::None,
         #[cfg(feature = "dns")]
-        dns_socket,
+        dns,
         #[cfg(feature = "dns")]
         dns_waker: WakerRegistration::new(),
         #[cfg(feature = "dhcpv4-hostname")]
         hostname: &mut resources.hostname,
-        #[cfg(feature = "dhcpv4-ntp")]
-        dhcp_rx_buffer: resources.dhcp_rx_buffer.write([0; DHCP_RX_BUFFER_SIZE]) as *mut [u8],
         #[cfg(feature = "packetmeta-timestamp")]
         timestamps: Channel::new(),
     };
@@ -423,75 +427,31 @@ pub fn new<'d, D: Driver, const SOCK: usize>(
     inner.set_config_v4(config.ipv4);
     #[cfg(feature = "proto-ipv6")]
     inner.set_config_v6(config.ipv6);
-    inner.apply_static_config();
+    inner.config_changed();
 
     let inner = &*resources.inner.write(RefCell::new(inner));
     let stack = Stack { inner };
-    (stack, Runner { driver, stack })
-}
-
-/// Parse the NTP servers (DHCP option 42) out of the raw DHCP reply retained by xarxa.
-///
-/// xarxa does not parse this option itself; it only exposes the raw packet (when a receive
-/// buffer is set), leaving it to consumers to read out the options they care about.
-#[cfg(feature = "dhcpv4-ntp")]
-fn parse_dhcp_ntp_servers(config: &dhcpv4::Config) -> Vec<Ipv4Address, 4> {
-    /// DHCP option code for NTP servers (RFC 2132 §8.3). Length is a multiple of 4, one address each.
-    const OPT_NTP_SERVERS: u8 = 42;
-
-    let mut servers = Vec::new();
-    let Some(packet) = config.packet.as_ref() else {
-        return servers;
-    };
-    for option in packet.options() {
-        if option.kind != OPT_NTP_SERVERS {
-            continue;
-        }
-        for chunk in option.data.chunks_exact(4) {
-            // Drop any servers past our capacity, like xarxa does for DNS servers.
-            if servers
-                .push(Ipv4Address::from_octets(chunk.try_into().unwrap()))
-                .is_err()
-            {
-                break;
-            }
-        }
-    }
-    servers
-}
-
-fn to_xarxa_hardware_address(addr: driver::HardwareAddress) -> (HardwareAddress, Medium) {
-    match addr {
-        #[cfg(feature = "medium-ethernet")]
-        driver::HardwareAddress::Ethernet(eth) => (HardwareAddress::Ethernet(EthernetAddress(eth)), Medium::Ethernet),
-        #[cfg(feature = "medium-ieee802154")]
-        driver::HardwareAddress::Ieee802154(ieee) => (
-            HardwareAddress::Ieee802154(Ieee802154Address::Extended(ieee)),
-            Medium::Ieee802154,
-        ),
-        #[cfg(feature = "medium-ip")]
-        driver::HardwareAddress::Ip => (HardwareAddress::Ip, Medium::Ip),
-
-        #[allow(unreachable_patterns)]
-        _ => panic!(
-            "Unsupported medium {:?}. Make sure to enable the right medium feature in embassy-net's Cargo features.",
-            addr
-        ),
-    }
+    (stack, Runner { stack })
 }
 
 impl<'d> Stack<'d> {
-    fn with<R>(&self, f: impl FnOnce(&Inner) -> R) -> R {
-        f(&self.inner.borrow())
-    }
-
-    fn with_mut<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> R {
+    /// Borrow the stack, without waking the runner.
+    pub(crate) fn with<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> R {
         f(&mut self.inner.borrow_mut())
     }
 
+    /// Borrow the stack, and wake the runner afterwards so it processes what
+    /// changed.
+    pub(crate) fn with_mut<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> R {
+        let mut inner = self.inner.borrow_mut();
+        let r = f(&mut inner);
+        inner.waker.wake();
+        r
+    }
+
     /// Get the hardware address of the network interface.
-    pub fn hardware_address(&self) -> HardwareAddress {
-        self.with(|i| i.hardware_address)
+    pub fn hardware_address(&self) -> xarxa::wire::HardwareAddress {
+        self.with(|i| i.stack.iface(i.iface).hardware_addr())
     }
 
     /// Check whether the link is up.
@@ -554,15 +514,17 @@ impl<'d> Stack<'d> {
     /// ```ignore
     /// let config = embassy_net::Config::dhcpv4(Default::default());
     /// // Init network stack
-    /// // NOTE: DHCP and DNS need one socket slot if enabled. This is why we're
-    /// // provisioning space for 3 sockets here: one for DHCP, one for DNS, and one for your code (e.g. TCP).
-    /// // If you use more sockets you must increase this. If you don't enable DHCP or DNS you can decrease it.
-    /// static RESOURCES: StaticCell<embassy_net::StackResources<3>> = StaticCell::new();
+    /// static RESOURCES: StaticCell<embassy_net::StackResources<Device>> = StaticCell::new();
+    /// static PACKET_STORAGE: StaticCell<embassy_net::PacketPoolStorage<32>> = StaticCell::new();
+    /// static PACKET_POOL: StaticCell<embassy_net::PacketPool<32>> = StaticCell::new();
+    /// let packet_storage = PACKET_STORAGE.init(embassy_net::PacketPoolStorage::new());
+    /// let packet_pool = PACKET_POOL.init(embassy_net::PacketPool::new(packet_storage));
     /// let (stack, runner) = embassy_net::new(
     ///    driver,
     ///    config,
     ///    RESOURCES.init(embassy_net::StackResources::new()),
-    ///    seed
+    ///    seed,
+    ///    packet_pool.allocator(),
     /// );
     /// // Launch network task that runs `runner.run().await`
     /// spawner.spawn(net_task(runner).unwrap());
@@ -589,7 +551,7 @@ impl<'d> Stack<'d> {
                 // when a config is applied (static, slaac or DHCP).
                 trace!("Waiting for config up");
 
-                self.with_mut(|i| {
+                self.with(|i| {
                     i.state_waker.register(cx.waker());
                 });
 
@@ -604,13 +566,13 @@ impl<'d> Stack<'d> {
     /// acquire an IP address, or Some if it has.
     #[cfg(feature = "proto-ipv4")]
     pub fn config_v4(&self) -> Option<StaticConfigV4> {
-        self.with(|i| i.static_v4.clone())
+        self.with(|i| i.config_v4())
     }
 
     /// Get the current IPv6 configuration.
     #[cfg(feature = "proto-ipv6")]
     pub fn config_v6(&self) -> Option<StaticConfigV6> {
-        self.with(|i| i.static_v6.clone())
+        self.with(|i| i.config_v6())
     }
 
     /// Set the IPv4 configuration.
@@ -618,7 +580,7 @@ impl<'d> Stack<'d> {
     pub fn set_config_v4(&self, config: ConfigV4) {
         self.with_mut(|i| {
             i.set_config_v4(config);
-            i.apply_static_config();
+            i.config_changed();
         })
     }
 
@@ -627,7 +589,7 @@ impl<'d> Stack<'d> {
     pub fn set_config_v6(&self, config: ConfigV6) {
         self.with_mut(|i| {
             i.set_config_v6(config);
-            i.apply_static_config();
+            i.config_changed();
         })
     }
 
@@ -657,17 +619,16 @@ impl<'d> Stack<'d> {
 
         let query = poll_fn(|cx| {
             self.with_mut(|i| {
-                let socket = i.sockets.get_mut::<dns::Socket>(i.dns_socket);
-                match socket.start_query(i.iface.context(), name, qtype) {
-                    Ok(handle) => {
-                        i.waker.wake();
-                        Poll::Ready(Ok(handle))
-                    }
-                    Err(dns::StartQueryError::NoFreeSlot) => {
-                        i.dns_waker.register(cx.waker());
+                let Inner {
+                    stack, dns, dns_waker, ..
+                } = i;
+                match dns.start_query(stack, name, qtype) {
+                    Ok(handle) => Poll::Ready(Ok::<_, dns::Error>(handle)),
+                    Err(xarxa::dns::StartQueryError::NoFreeSlot) => {
+                        dns_waker.register(cx.waker());
                         Poll::Pending
                     }
-                    Err(e) => Poll::Ready(Err(e)),
+                    Err(e) => Poll::Ready(Err(e.into())),
                 }
             })
         })
@@ -698,29 +659,24 @@ impl<'d> Stack<'d> {
 
         let drop = OnDrop::new(|| {
             self.with_mut(|i| {
-                let socket = i.sockets.get_mut::<dns::Socket>(i.dns_socket);
-                socket.cancel_query(query);
-                i.waker.wake();
+                i.dns.cancel_query(query);
                 i.dns_waker.wake();
             })
         });
 
         let res = poll_fn(|cx| {
-            self.with_mut(|i| {
-                let socket = i.sockets.get_mut::<dns::Socket>(i.dns_socket);
-                match socket.get_query_result(query) {
-                    Ok(addrs) => {
-                        i.dns_waker.wake();
-                        Poll::Ready(Ok(addrs))
-                    }
-                    Err(dns::GetQueryResultError::Pending) => {
-                        socket.register_query_waker(query, cx.waker());
-                        Poll::Pending
-                    }
-                    Err(e) => {
-                        i.dns_waker.wake();
-                        Poll::Ready(Err(e.into()))
-                    }
+            self.with_mut(|i| match i.dns.get_query_result(query) {
+                Ok(addrs) => {
+                    i.dns_waker.wake();
+                    Poll::Ready(Ok(addrs))
+                }
+                Err(xarxa::dns::GetQueryResultError::Pending) => {
+                    i.dns.register_query_waker(query, cx.waker());
+                    Poll::Pending
+                }
+                Err(e) => {
+                    i.dns_waker.wake();
+                    Poll::Ready(Err(e.into()))
                 }
             })
         })
@@ -736,351 +692,305 @@ impl<'d> Stack<'d> {
 impl<'d> Stack<'d> {
     /// Join a multicast group.
     pub fn join_multicast_group(&self, addr: impl Into<IpAddress>) -> Result<(), MulticastError> {
-        self.with_mut(|i| i.iface.join_multicast_group(addr))
+        self.with_mut(|i| i.stack.iface(i.iface).join_multicast_group(addr))
     }
 
     /// Leave a multicast group.
     pub fn leave_multicast_group(&self, addr: impl Into<IpAddress>) -> Result<(), MulticastError> {
-        self.with_mut(|i| i.iface.leave_multicast_group(addr))
+        self.with_mut(|i| i.stack.iface(i.iface).leave_multicast_group(addr))
     }
 
     /// Get whether the network stack has joined the given multicast group.
     pub fn has_multicast_group(&self, addr: impl Into<IpAddress>) -> bool {
-        self.with(|i| i.iface.has_multicast_group(addr))
+        self.with(|i| i.stack.iface(i.iface).has_multicast_group(addr))
     }
 }
 
 impl Inner {
-    #[cfg(feature = "slaac")]
-    fn get_link_local_address(&self) -> IpCidr {
-        let ll_prefix = Ipv6Cidr::new(Ipv6Cidr::LINK_LOCAL_PREFIX.address(), 64);
-        Ipv6Cidr::from_link_prefix(&ll_prefix, self.hardware_address)
-            .unwrap()
-            .into()
+    #[cfg(feature = "proto-ipv4")]
+    fn config_v4(&mut self) -> Option<StaticConfigV4> {
+        let handle = self.iface;
+        let iface = self.stack.iface(handle);
+        let address = iface.ip_addrs().iter().find_map(|a| match a.cidr {
+            IpCidr::Ipv4(cidr) => Some(cidr),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        })?;
+        let dns_servers = match &self.config_v4 {
+            ConfigV4::Static(c) => c.dns_servers.clone(),
+            #[cfg(feature = "dhcpv4")]
+            ConfigV4::Dhcp(_) => iface
+                .dhcpv4_lease()
+                .map(|lease| lease.dns_servers.iter().copied().take(MAX_DNS_SERVERS).collect())
+                .unwrap_or_default(),
+            ConfigV4::None => Vec::new(),
+        };
+        let gateway = self
+            .stack
+            .routes()
+            .get_default_ipv4_route()
+            .and_then(|r| match r.via_router {
+                IpAddress::Ipv4(gateway) => Some(gateway),
+                #[allow(unreachable_patterns)]
+                _ => None,
+            });
+        Some(StaticConfigV4 {
+            address,
+            gateway,
+            dns_servers,
+        })
     }
 
-    #[allow(clippy::absurd_extreme_comparisons)]
-    pub fn get_local_port(&mut self) -> u16 {
-        let res = self.next_local_port;
-        self.next_local_port = if res >= LOCAL_PORT_MAX { LOCAL_PORT_MIN } else { res + 1 };
-        res
+    #[cfg(feature = "proto-ipv6")]
+    fn config_v6(&mut self) -> Option<StaticConfigV6> {
+        let handle = self.iface;
+        let iface = self.stack.iface(handle);
+        let address = iface.ip_addrs().iter().find_map(|a| match (a.cidr, a.origin) {
+            // The link-local address the stack derives from the hardware address is not part
+            // of the reported config.
+            #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+            (_, AddrOrigin::LinkLocal) => None,
+            (IpCidr::Ipv6(cidr), _) => Some(cidr),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        })?;
+        let dns_servers = match &self.config_v6 {
+            ConfigV6::Static(c) => c.dns_servers.clone(),
+            _ => Vec::new(), // RDNSS not (yet) supported by xarxa.
+        };
+        let gateway = self
+            .stack
+            .routes()
+            .get_default_ipv6_route()
+            .and_then(|r| match r.via_router {
+                IpAddress::Ipv6(gateway) => Some(gateway),
+                #[allow(unreachable_patterns)]
+                _ => None,
+            });
+        Some(StaticConfigV6 {
+            address,
+            gateway,
+            dns_servers,
+        })
+    }
+
+    /// Remove the manually assigned addresses of one IP version, and the manual
+    /// default route.
+    fn clear_manual_config(&mut self, v4: bool) {
+        let handle = self.iface;
+        let mut iface = self.stack.iface(handle);
+        loop {
+            let addr = iface.ip_addrs().iter().find_map(|a| {
+                let matches_version = match a.cidr {
+                    #[cfg(feature = "proto-ipv4")]
+                    IpCidr::Ipv4(_) => v4,
+                    #[cfg(feature = "proto-ipv6")]
+                    IpCidr::Ipv6(_) => !v4,
+                };
+                (a.origin == AddrOrigin::Manual && matches_version).then_some(a.cidr.address())
+            });
+            match addr {
+                Some(addr) => {
+                    iface.remove_ip_addr(addr);
+                }
+                None => break,
+            }
+        }
+        self.stack.routes_mut().retain(|r| {
+            let matches_version = match r.via_router {
+                #[cfg(feature = "proto-ipv4")]
+                IpAddress::Ipv4(_) => v4,
+                #[cfg(feature = "proto-ipv6")]
+                IpAddress::Ipv6(_) => !v4,
+            };
+            !(matches_version && r.origin == RouteOrigin::Manual)
+        });
     }
 
     #[cfg(feature = "proto-ipv4")]
     pub fn set_config_v4(&mut self, config: ConfigV4) {
-        // Handle static config.
-        self.static_v4 = match config.clone() {
-            ConfigV4::None => None,
-            #[cfg(feature = "dhcpv4")]
-            ConfigV4::Dhcp(_) => None,
-            ConfigV4::Static(c) => Some(c),
-        };
-
-        // Handle DHCP config.
+        let handle = self.iface;
         #[cfg(feature = "dhcpv4")]
-        match config {
-            ConfigV4::Dhcp(c) => {
-                // Create the socket if it doesn't exist.
-                if self.dhcp_socket.is_none() {
-                    #[allow(unused_mut)]
-                    let mut socket = xarxa::socket::dhcpv4::Socket::new();
+        self.stack.iface(handle).set_dhcpv4(None);
+        self.clear_manual_config(true);
 
-                    #[cfg(feature = "dhcpv4-ntp")]
-                    {
-                        // xarxa doesn't parse options it doesn't know about (e.g. NTP), but it can
-                        // retain the raw reply so we can read them out. safety: this pointer lives as
-                        // long as the stack, since `new()` borrows the resources for `'d`.
-                        let buffer = unsafe { &mut *self.dhcp_rx_buffer };
-                        socket.set_receive_packet_buffer(buffer);
-                    }
-
-                    let handle = self.sockets.add(socket);
-                    self.dhcp_socket = Some(handle);
+        match &config {
+            ConfigV4::None => {}
+            ConfigV4::Static(c) => {
+                unwrap!(self.stack.iface(handle).add_ip_addr(IpCidr::Ipv4(c.address)).ok());
+                if let Some(gateway) = c.gateway {
+                    unwrap!(self.stack.routes_mut().add_default_ipv4_route(gateway, handle).ok());
                 }
+            }
+            #[cfg(feature = "dhcpv4")]
+            ConfigV4::Dhcp(c) => {
+                let mut cfg = xarxa::iface::dhcpv4::DhcpConfig::default();
+                cfg.max_lease_duration = c.max_lease_duration.map(crate::time::duration_to_xarxa);
+                cfg.ignore_naks = c.ignore_naks;
 
-                // Configure it
-                let socket = self.sockets.get_mut::<dhcpv4::Socket>(unwrap!(self.dhcp_socket));
-                socket.set_ignore_naks(c.ignore_naks);
-                socket.set_max_lease_duration(c.max_lease_duration.map(crate::time::duration_to_xarxa));
-                socket.set_ports(c.server_port, c.client_port);
-                socket.set_retry_config(c.retry_config);
-
-                socket.set_outgoing_options(&[]);
                 #[cfg(feature = "dhcpv4-hostname")]
-                if let Some(h) = c.hostname {
+                if let Some(h) = &c.hostname {
                     // safety:
-                    // - we just did set_outgoing_options([]) so we know the socket is no longer holding a reference.
-                    // - we know this pointer lives for as long as the stack exists, because `new()` borrows
-                    //   the resources for `'d`. Therefore it's OK to pass a reference to this to xarxa.
+                    // - the previous DHCP client was just removed, so nothing holds a reference
+                    //   to the old option.
+                    // - the pointer lives for as long as the stack exists, because `new()` borrows
+                    //   the resources for `'d`. Therefore it's OK to pass a `'static` reference to xarxa.
                     let hostname = unsafe { &mut *self.hostname };
 
                     // create data
                     let data = hostname.data.write([0; MAX_HOSTNAME_LEN]);
                     data[..h.len()].copy_from_slice(h.as_bytes());
                     let data: &[u8] = &data[..h.len()];
+                    let data: &'static [u8] = unsafe { core::mem::transmute(data) };
 
                     // set the option.
-                    let option = hostname.option.write(xarxa::wire::DhcpOption { data, kind: 12 });
-                    socket.set_outgoing_options(core::slice::from_ref(option));
+                    let option = hostname.option.write([xarxa::wire::DhcpOption { data, kind: 12 }]);
+                    let option: &'static [xarxa::wire::DhcpOption<'static>] =
+                        unsafe { core::mem::transmute(&option[..]) };
+                    cfg.outgoing_options = option;
                 }
 
-                socket.reset();
-            }
-            _ => {
-                // Remove DHCP socket if any.
-                if let Some(socket) = self.dhcp_socket {
-                    self.sockets.remove(socket);
-                    self.dhcp_socket = None;
-                }
+                self.stack.iface(handle).set_dhcpv4(Some(cfg));
             }
         }
+
+        self.config_v4 = config;
     }
 
     #[cfg(feature = "proto-ipv6")]
     pub fn set_config_v6(&mut self, config: ConfigV6) {
+        let handle = self.iface;
         #[cfg(feature = "slaac")]
-        {
-            self.slaac = matches!(config, ConfigV6::Slaac);
-        }
-        self.static_v6 = match config {
-            ConfigV6::None => None,
-            ConfigV6::Static(c) => Some(c),
+        self.stack.iface(handle).set_slaac(None);
+        self.clear_manual_config(false);
+
+        match &config {
+            ConfigV6::None => {}
+            ConfigV6::Static(c) => {
+                unwrap!(self.stack.iface(handle).add_ip_addr(IpCidr::Ipv6(c.address)).ok());
+                if let Some(gateway) = c.gateway {
+                    unwrap!(self.stack.routes_mut().add_default_ipv6_route(gateway, handle).ok());
+                }
+            }
             #[cfg(feature = "slaac")]
-            ConfigV6::Slaac => None,
-        };
+            ConfigV6::Slaac => {
+                self.stack
+                    .iface(handle)
+                    .set_slaac(Some(xarxa::iface::slaac::SlaacConfig::default()));
+            }
+        }
+
+        self.config_v6 = config;
     }
 
-    fn apply_static_config(&mut self) {
-        let mut addrs = Vec::new();
+    /// React to a change in the interface's configuration: log it, hand the DNS
+    /// servers to the DNS client, and wake whoever waits for the configuration.
+    fn config_changed(&mut self) {
+        self.config_generation = self.stack.iface(self.iface).config_generation();
+
         #[cfg(feature = "dns")]
-        let mut dns_servers: Vec<_, 6> = Vec::new();
-        #[cfg(feature = "proto-ipv4")]
-        let mut gateway_v4 = None;
-        #[cfg(feature = "proto-ipv6")]
-        let mut gateway_v6 = None;
+        let mut dns_servers: Vec<IpAddress, { 2 * MAX_DNS_SERVERS }> = Vec::new();
 
         #[cfg(feature = "proto-ipv4")]
-        if let Some(config) = &self.static_v4 {
+        if let Some(config) = self.config_v4() {
             info!("IPv4: UP");
             info!("   IP address:      {:?}", config.address);
             info!("   Default gateway: {:?}", config.gateway);
-
-            unwrap!(addrs.push(IpCidr::Ipv4(config.address)).ok());
-            gateway_v4 = config.gateway;
-            #[cfg(feature = "dns")]
             for s in &config.dns_servers {
                 info!("   DNS server:      {:?}", s);
-                unwrap!(dns_servers.push(s.clone().into()).ok());
+                #[cfg(feature = "dns")]
+                unwrap!(dns_servers.push((*s).into()).ok());
             }
         } else {
             info!("IPv4: DOWN");
         }
 
         #[cfg(feature = "proto-ipv6")]
-        if let Some(config) = &self.static_v6 {
+        if let Some(config) = self.config_v6() {
             info!("IPv6: UP");
             info!("   IP address:      {:?}", config.address);
             info!("   Default gateway: {:?}", config.gateway);
-
-            unwrap!(addrs.push(IpCidr::Ipv6(config.address)).ok());
-            gateway_v6 = config.gateway;
-            #[cfg(feature = "dns")]
             for s in &config.dns_servers {
                 info!("   DNS server:      {:?}", s);
-                unwrap!(dns_servers.push(s.clone().into()).ok());
+                #[cfg(feature = "dns")]
+                unwrap!(dns_servers.push((*s).into()).ok());
             }
         } else {
             info!("IPv6: DOWN");
         }
 
-        // Apply addresses
-        self.iface.update_ip_addrs(|a| {
-            *a = addrs;
-        });
-
-        // Add the link local-address
-        #[cfg(feature = "slaac")]
-        {
-            let ll_address = self.get_link_local_address();
-            self.iface.update_ip_addrs(|a| {
-                let _ = a.push(ll_address);
-            })
-        }
-
-        // Apply gateways
-        #[cfg(feature = "proto-ipv4")]
-        if let Some(gateway) = gateway_v4 {
-            unwrap!(self.iface.routes_mut().add_default_ipv4_route(gateway));
-        } else {
-            self.iface.routes_mut().remove_default_ipv4_route();
-        }
-        #[cfg(feature = "proto-ipv6")]
-        if let Some(gateway) = gateway_v6 {
-            unwrap!(self.iface.routes_mut().add_default_ipv6_route(gateway));
-        } else {
-            self.iface.routes_mut().remove_default_ipv6_route();
-        }
-
-        // Apply DNS servers
         #[cfg(feature = "dns")]
-        if !dns_servers.is_empty() {
+        {
             let count = if dns_servers.len() > DNS_MAX_SERVER_COUNT {
                 warn!("Number of DNS servers exceeds DNS_MAX_SERVER_COUNT, truncating list.");
                 DNS_MAX_SERVER_COUNT
             } else {
                 dns_servers.len()
             };
-            self.sockets
-                .get_mut::<xarxa::socket::dns::Socket>(self.dns_socket)
-                .update_servers(&dns_servers[..count]);
+            self.dns.update_servers(&dns_servers[..count]);
         }
 
         self.state_waker.wake();
     }
 
-    fn poll<D: Driver>(&mut self, cx: &mut Context<'_>, driver: &mut D) {
+    fn poll(&mut self, cx: &mut Context<'_>) {
         self.waker.register(cx.waker());
 
-        let (_hardware_addr, medium) = to_xarxa_hardware_address(driver.hardware_address());
-
-        #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-        {
-            let do_set = match medium {
-                #[cfg(feature = "medium-ethernet")]
-                Medium::Ethernet => true,
-                #[cfg(feature = "medium-ieee802154")]
-                Medium::Ieee802154 => true,
-                #[allow(unreachable_patterns)]
-                _ => false,
-            };
-            if do_set {
-                self.iface.set_hardware_addr(_hardware_addr);
-            }
-        }
-
-        #[cfg(feature = "packetmeta-timestamp")]
-        while driver.capabilities().timestamp
-            && !self.timestamps.is_full()
-            && let Some(timestamp) = driver.poll_timestamp(cx)
-        {
-            self.timestamps.try_send(timestamp).unwrap();
-        }
-
-        #[cfg(feature = "packetmeta-timestamp")]
-        if driver.capabilities().timestamp && self.timestamps.is_full() {
-            let _ = self.timestamps.poll_ready_to_send(cx);
-            warn!("iface is stalled because timestamp channel is full.");
-
-            return;
-        }
+        let link_up = {
+            // The interface owns the only mutable route to the driver. The
+            // borrow ends before the stack poll below.
+            let mut iface = self.stack.iface(self.iface);
+            let driver = iface.driver_mut();
+            unwrap!(driver.register_waker(cx.waker()).ok());
+            driver.link_state() == LinkState::Up
+        };
 
         // Update link up
         let old_link_up = self.link_up;
-        self.link_up = driver.link_state(cx) == LinkState::Up;
+        self.link_up = link_up;
 
         // Print when changed
         if old_link_up != self.link_up {
             info!("link_up = {:?}", self.link_up);
             self.state_waker.wake();
+
+            // Start over on link-state change, so a lease on the previous network is
+            // not kept, and a new one is obtained right away.
+            #[cfg(feature = "dhcpv4")]
+            self.stack.iface(self.iface).restart_dhcpv4();
         }
 
-        // Reset the DHCP socket on link-state change before polling, else a stale DISCOVER
-        // is sent by the poll below and discarded, causing a second DISCOVER on the next poll.
-        #[cfg(feature = "dhcpv4")]
-        if old_link_up != self.link_up
-            && let Some(dhcp_handle) = self.dhcp_socket
+        #[cfg(feature = "packetmeta-timestamp")]
         {
-            self.sockets.get_mut::<dhcpv4::Socket>(dhcp_handle).reset();
-        }
-
-        let timestamp = instant_to_xarxa(Instant::now());
-        let mut smoldev = DriverAdapter {
-            cx: Some(cx),
-            inner: driver,
-            medium,
-            tx_exhausted: false,
-        };
-        self.iface.poll(timestamp, &mut smoldev, &mut self.sockets);
-        let tx_exhausted = smoldev.tx_exhausted;
-
-        #[allow(unused_mut)]
-        let mut configure = false;
-
-        #[cfg(feature = "dhcpv4")]
-        {
-            configure |= if let Some(dhcp_handle) = self.dhcp_socket {
-                let socket = self.sockets.get_mut::<dhcpv4::Socket>(dhcp_handle);
-
-                if self.link_up {
-                    match socket.poll() {
-                        None => false,
-                        Some(dhcpv4::Event::Deconfigured) => {
-                            self.static_v4 = None;
-                            true
-                        }
-                        Some(dhcpv4::Event::Configured(config)) => {
-                            #[cfg(feature = "dhcpv4-ntp")]
-                            let ntp_servers = parse_dhcp_ntp_servers(&config);
-                            self.static_v4 = Some(StaticConfigV4 {
-                                address: config.address,
-                                gateway: config.router,
-                                dns_servers: config.dns_servers,
-                                #[cfg(feature = "dhcpv4-ntp")]
-                                ntp_servers,
-                            });
-                            true
-                        }
-                    }
-                } else if old_link_up {
-                    self.static_v4 = None;
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
+            while !self.timestamps.is_full()
+                && let Some(timestamp) = self.stack.iface(self.iface).poll_tx_timestamp()
+            {
+                self.timestamps.try_send(timestamp).unwrap();
+            }
+            if self.timestamps.is_full() {
+                let _ = self.timestamps.poll_ready_to_send(cx);
+                warn!("iface is stalled because timestamp channel is full.");
+                return;
             }
         }
 
-        #[cfg(feature = "slaac")]
-        if self.slaac && self.iface.slaac_updated_at() == timestamp {
-            let ipv6_address = self.iface.ip_addrs().iter().find_map(|addr| match addr {
-                IpCidr::Ipv6(ip6_address) if !Ipv6Cidr::LINK_LOCAL_PREFIX.contains_addr(&ip6_address.address()) => {
-                    Some(ip6_address)
-                }
-                _ => None,
-            });
-            self.static_v6 = if let Some(address) = ipv6_address {
-                let gateway = self
-                    .iface
-                    .routes()
-                    .get_default_ipv6_route()
-                    .map(|r| match r.via_router {
-                        IpAddress::Ipv6(gateway) => Some(gateway),
-                        #[cfg(feature = "proto-ipv4")]
-                        _ => None,
-                    })
-                    .flatten();
-                let config = StaticConfigV6 {
-                    address: *address,
-                    gateway,
-                    dns_servers: Vec::new(), // RDNSS not (yet) supported by xarxa.
-                };
-                Some(config)
-            } else {
-                None
-            };
-            configure = true;
-        }
+        let now = instant_to_xarxa(Instant::now());
+        #[allow(unused_mut)]
+        let mut deadline = self.stack.poll(now);
 
-        if configure {
-            self.apply_static_config()
-        }
-
-        if let Some(poll_at) = self.iface.poll_at(timestamp, &mut self.sockets)
-            && !tx_exhausted
+        #[cfg(feature = "dns")]
         {
-            let t = pin!(Timer::at(instant_from_xarxa(poll_at)));
+            deadline = deadline.min(self.dns.poll(&mut self.stack));
+        }
+
+        if self.stack.iface(self.iface).config_generation() != self.config_generation {
+            self.config_changed();
+        }
+
+        if deadline <= now {
+            cx.waker().wake_by_ref();
+        } else if deadline != xarxa::time::Instant::MAX {
+            let t = pin!(Timer::at(instant_from_xarxa(deadline)));
             if t.poll(cx).is_ready() {
                 cx.waker().wake_by_ref();
             }
@@ -1088,13 +998,13 @@ impl Inner {
     }
 }
 
-impl<'d, D: Driver> Runner<'d, D> {
+impl<'d> Runner<'d> {
     /// Run the network stack.
     ///
     /// You must call this in a background task, to process network events.
     pub async fn run(&mut self) -> ! {
         poll_fn(|cx| {
-            self.stack.with_mut(|i| i.poll(cx, &mut self.driver));
+            self.stack.with(|i| i.poll(cx));
             Poll::<()>::Pending
         })
         .await;

@@ -7,7 +7,7 @@ mod common;
 use common::*;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
-use embassy_net::StackResources;
+use embassy_net::{PacketPool, PacketPoolStorage, StackResources};
 use embassy_stm32::eth::{Ethernet, GenericPhy, PacketQueue, Sma};
 use embassy_stm32::peripherals::{ETH, ETH_SMA};
 #[cfg(feature = "stop")]
@@ -33,7 +33,7 @@ bind_interrupts!(struct Irqs {
 type Device = Ethernet<'static, ETH, GenericPhy<Sma<'static, ETH_SMA>>>;
 
 #[embassy_executor::task]
-async fn net_task(mut runner: embassy_net::Runner<'static, Device>) -> ! {
+async fn net_task(mut runner: embassy_net::Runner<'static>) -> ! {
     runner.run().await
 }
 
@@ -74,11 +74,19 @@ async fn main(spawner: Spawner) {
     const PACKET_QUEUE_SIZE: usize = 2;
     #[cfg(not(feature = "stm32f207zg"))]
     const PACKET_QUEUE_SIZE: usize = 4;
+    const PACKET_POOL_SIZE: usize = 32;
 
     static PACKETS: StaticCell<PacketQueue<PACKET_QUEUE_SIZE, PACKET_QUEUE_SIZE>> = StaticCell::new();
+    static PACKET_STORAGE: StaticCell<PacketPoolStorage<PACKET_POOL_SIZE>> = StaticCell::new();
+    static PACKET_POOL: StaticCell<PacketPool<PACKET_POOL_SIZE>> = StaticCell::new();
+    let packet_storage = PACKET_STORAGE.init(PacketPoolStorage::new());
+    let packet_pool = PACKET_POOL.init(PacketPool::new(packet_storage));
+    let packet_allocator = packet_pool.allocator();
 
     let device = Ethernet::new(
-        PACKETS.init(PacketQueue::<PACKET_QUEUE_SIZE, PACKET_QUEUE_SIZE>::new()),
+        PACKETS.init(PacketQueue::<PACKET_QUEUE_SIZE, PACKET_QUEUE_SIZE>::new(
+            packet_allocator,
+        )),
         p.ETH,
         Irqs,
         p.PA1,
@@ -105,8 +113,14 @@ async fn main(spawner: Spawner) {
     //});
 
     // Init network stack
-    static RESOURCES: StaticCell<StackResources<2>> = StaticCell::new();
-    let (stack, runner) = embassy_net::new(device, config, RESOURCES.init(StackResources::new()), seed);
+    static RESOURCES: StaticCell<StackResources<Device>> = StaticCell::new();
+    let (stack, runner) = embassy_net::new(
+        device,
+        config,
+        RESOURCES.init(StackResources::new()),
+        seed,
+        packet_allocator,
+    );
 
     #[cfg(feature = "stop")]
     let _guard = WakeGuard::new(StopMode::Stop1);
