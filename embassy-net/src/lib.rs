@@ -13,6 +13,7 @@ compile_error!("You must enable at least one of the following features: proto-ip
 // This mod MUST go first, so that the others see its macros.
 pub(crate) mod fmt;
 
+mod cooperative;
 #[cfg(feature = "dns")]
 pub mod dns;
 mod driver_util;
@@ -70,6 +71,9 @@ pub use xarxa::wire::{Ipv6Address, Ipv6Cidr};
 
 use crate::driver_util::DriverAdapter;
 use crate::time::{instant_from_xarxa, instant_to_xarxa};
+#[cfg(feature = "cooperative-scheduler-telemetry")]
+pub use cooperative::{CooperativePollExit, CooperativePollReport};
+use cooperative::{CooperativePollState, DIRECTION_QUANTUM, EGRESS_LIMIT, take_start_direction};
 
 const LOCAL_PORT_MIN: u16 = 1025;
 const LOCAL_PORT_MAX: u16 = 65535;
@@ -340,6 +344,7 @@ pub(crate) struct Inner {
     dhcp_rx_buffer: *mut [u8],
     #[cfg(feature = "packetmeta-timestamp")]
     timestamps: Channel<NoopRawMutex, TxTimestamp, 5>,
+    cooperative_starts_with_ingress: bool,
 }
 
 fn _assert_covariant<'a, 'b: 'a>(x: Stack<'b>) -> Stack<'a> {
@@ -369,6 +374,9 @@ pub fn new<'d, D: Driver, const SOCK: usize>(
             cx: None,
             medium,
             tx_exhausted: false,
+            tx_tokens_issued: 0,
+            tx_token_limit: None,
+            tx_budget_exhausted: false,
         },
         instant_to_xarxa(Instant::now()),
     );
@@ -417,6 +425,7 @@ pub fn new<'d, D: Driver, const SOCK: usize>(
         dhcp_rx_buffer: resources.dhcp_rx_buffer.write([0; DHCP_RX_BUFFER_SIZE]) as *mut [u8],
         #[cfg(feature = "packetmeta-timestamp")]
         timestamps: Channel::new(),
+        cooperative_starts_with_ingress: true,
     };
 
     #[cfg(feature = "proto-ipv4")]
@@ -939,6 +948,37 @@ impl Inner {
     }
 
     fn poll<D: Driver>(&mut self, cx: &mut Context<'_>, driver: &mut D) {
+        self.poll_with(
+            cx,
+            driver,
+            false,
+            #[cfg(feature = "cooperative-scheduler-telemetry")]
+            None,
+        )
+    }
+
+    fn poll_work_conserving<D: Driver>(
+        &mut self,
+        cx: &mut Context<'_>,
+        driver: &mut D,
+        #[cfg(feature = "cooperative-scheduler-telemetry")] observer: Option<fn(CooperativePollReport)>,
+    ) {
+        self.poll_with(
+            cx,
+            driver,
+            true,
+            #[cfg(feature = "cooperative-scheduler-telemetry")]
+            observer,
+        )
+    }
+
+    fn poll_with<D: Driver>(
+        &mut self,
+        cx: &mut Context<'_>,
+        driver: &mut D,
+        work_conserving: bool,
+        #[cfg(feature = "cooperative-scheduler-telemetry")] observer: Option<fn(CooperativePollReport)>,
+    ) {
         self.waker.register(cx.waker());
 
         let (_hardware_addr, medium) = to_xarxa_hardware_address(driver.hardware_address());
@@ -999,9 +1039,55 @@ impl Inner {
             inner: driver,
             medium,
             tx_exhausted: false,
+            tx_tokens_issued: 0,
+            tx_token_limit: None,
+            tx_budget_exhausted: false,
         };
-        self.iface.poll(timestamp, &mut smoldev, &mut self.sockets);
-        let tx_exhausted = smoldev.tx_exhausted;
+        let mut cooperative_state = None;
+        if work_conserving {
+            self.iface.poll_maintenance(timestamp);
+            let starts_with_ingress = take_start_direction(&mut self.cooperative_starts_with_ingress);
+            let mut state = CooperativePollState::new(starts_with_ingress);
+            while state.can_poll() {
+                for ingress_turn in [starts_with_ingress, !starts_with_ingress] {
+                    if ingress_turn {
+                        for _ in 0..DIRECTION_QUANTUM {
+                            if !state.can_poll_ingress() {
+                                break;
+                            }
+                            let ingress = self
+                                .iface
+                                .poll_ingress_single(timestamp, &mut smoldev, &mut self.sockets);
+                            state.record_ingress(ingress);
+                        }
+                    } else if state.can_poll_egress() {
+                        let issued_before = smoldev.tx_tokens_issued;
+                        let quantum_end = issued_before
+                            .saturating_add(u32::from(DIRECTION_QUANTUM))
+                            .min(u32::from(EGRESS_LIMIT));
+                        smoldev.set_tx_token_limit(Some(quantum_end));
+                        let egress = self.iface.poll_egress(timestamp, &mut smoldev, &mut self.sockets);
+                        let issued = smoldev.tx_tokens_issued.saturating_sub(issued_before);
+                        let blocked = smoldev.take_tx_exhausted();
+                        let quantum_exhausted = smoldev.take_tx_budget_exhausted();
+                        state.record_egress(egress, issued, blocked, quantum_exhausted);
+                    }
+                }
+            }
+            #[cfg(feature = "cooperative-scheduler-telemetry")]
+            if let Some(observer) = observer {
+                observer(state.report());
+            }
+            let self_wake = state.should_self_wake();
+            cooperative_state = Some((state.egress_blocked, self_wake));
+        } else {
+            self.iface.poll(timestamp, &mut smoldev, &mut self.sockets);
+        }
+        let (tx_exhausted, cooperative_self_wake) = cooperative_state.unwrap_or((smoldev.tx_exhausted, false));
+        drop(smoldev);
+        if cooperative_self_wake {
+            cx.waker().wake_by_ref();
+        }
 
         #[allow(unused_mut)]
         let mut configure = false;
@@ -1095,6 +1181,39 @@ impl<'d, D: Driver> Runner<'d, D> {
     pub async fn run(&mut self) -> ! {
         poll_fn(|cx| {
             self.stack.with_mut(|i| i.poll(cx, &mut self.driver));
+            Poll::<()>::Pending
+        })
+        .await;
+        unreachable!()
+    }
+
+    /// Run a bounded, directionally fair, work-conserving network stack.
+    ///
+    /// The scheduling policy is owned here rather than supplied by the caller:
+    /// test direction and benchmark configuration cannot change production
+    /// behavior.
+    pub async fn run_work_conserving(&mut self) -> ! {
+        poll_fn(|cx| {
+            self.stack.with_mut(|i| {
+                i.poll_work_conserving(
+                    cx,
+                    &mut self.driver,
+                    #[cfg(feature = "cooperative-scheduler-telemetry")]
+                    None,
+                )
+            });
+            Poll::<()>::Pending
+        })
+        .await;
+        unreachable!()
+    }
+
+    /// Qualification-only observation of the production scheduling policy.
+    #[cfg(feature = "cooperative-scheduler-telemetry")]
+    pub async fn run_work_conserving_observed(&mut self, observer: fn(CooperativePollReport)) -> ! {
+        poll_fn(|cx| {
+            self.stack
+                .with_mut(|i| i.poll_work_conserving(cx, &mut self.driver, Some(observer)));
             Poll::<()>::Pending
         })
         .await;

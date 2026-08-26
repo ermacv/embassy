@@ -12,6 +12,24 @@ where
     pub inner: &'d mut T,
     pub medium: Medium,
     pub tx_exhausted: bool,
+    pub tx_tokens_issued: u32,
+    pub tx_token_limit: Option<u32>,
+    pub tx_budget_exhausted: bool,
+}
+
+impl<T: Driver> DriverAdapter<'_, '_, T> {
+    pub fn take_tx_exhausted(&mut self) -> bool {
+        core::mem::replace(&mut self.tx_exhausted, false)
+    }
+
+    pub fn set_tx_token_limit(&mut self, limit: Option<u32>) {
+        self.tx_token_limit = limit;
+        self.tx_budget_exhausted = false;
+    }
+
+    pub fn take_tx_budget_exhausted(&mut self) -> bool {
+        core::mem::replace(&mut self.tx_budget_exhausted, false)
+    }
 }
 
 impl<'d, 'c, T> phy::Device for DriverAdapter<'d, 'c, T>
@@ -35,9 +53,17 @@ where
 
     /// Construct a transmit token.
     fn transmit(&mut self) -> Option<Self::TxToken<'_>> {
+        if self.tx_token_limit.is_some_and(|limit| self.tx_tokens_issued >= limit) {
+            self.tx_budget_exhausted = true;
+            return None;
+        }
         let token = self.inner.transmit(unwrap!(self.cx.as_deref_mut())).map(TxTokenAdapter);
 
-        self.tx_exhausted = token.is_none();
+        if token.is_some() {
+            self.tx_tokens_issued = self.tx_tokens_issued.saturating_add(1);
+        } else {
+            self.tx_exhausted = true;
+        }
 
         token
     }
@@ -167,4 +193,120 @@ pub(crate) fn into_embassy_net_meta(meta: phy::PacketMeta) -> PacketMeta {
         out_meta.request_timestamp = meta.request_timestamp;
     }
     out_meta
+}
+
+#[cfg(test)]
+mod tests {
+    use core::task::{Context, Waker};
+
+    use embassy_net_driver::{Driver, HardwareAddress, LinkState, RxToken, TxToken};
+    use xarxa::phy::Device;
+
+    use super::*;
+
+    struct TestDriver {
+        transmit_calls: u32,
+        tx_available: bool,
+    }
+
+    struct TestRxToken;
+
+    impl RxToken for TestRxToken {
+        fn consume<R, F>(self, f: F) -> R
+        where
+            F: FnOnce(&mut [u8]) -> R,
+        {
+            f(&mut [])
+        }
+    }
+
+    struct TestTxToken;
+
+    impl TxToken for TestTxToken {
+        fn consume<R, F>(self, _len: usize, f: F) -> R
+        where
+            F: FnOnce(&mut [u8]) -> R,
+        {
+            f(&mut [])
+        }
+    }
+
+    impl Driver for TestDriver {
+        type RxToken<'a> = TestRxToken;
+        type TxToken<'a> = TestTxToken;
+
+        fn receive(&mut self, _cx: &mut Context<'_>) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+            None
+        }
+
+        fn transmit(&mut self, _cx: &mut Context<'_>) -> Option<Self::TxToken<'_>> {
+            self.transmit_calls += 1;
+            self.tx_available.then_some(TestTxToken)
+        }
+
+        fn link_state(&mut self, _cx: &mut Context<'_>) -> LinkState {
+            LinkState::Up
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+
+        fn hardware_address(&self) -> HardwareAddress {
+            HardwareAddress::Ethernet([0; 6])
+        }
+    }
+
+    fn adapter<'d, 'c>(driver: &'d mut TestDriver, cx: &'d mut Context<'c>) -> DriverAdapter<'d, 'c, TestDriver> {
+        DriverAdapter {
+            cx: Some(cx),
+            inner: driver,
+            medium: Medium::Ethernet,
+            tx_exhausted: false,
+            tx_tokens_issued: 0,
+            tx_token_limit: None,
+            tx_budget_exhausted: false,
+        }
+    }
+
+    #[test]
+    fn artificial_tx_budget_is_not_hardware_exhaustion() {
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut driver = TestDriver {
+            transmit_calls: 0,
+            tx_available: true,
+        };
+        let mut adapter = adapter(&mut driver, &mut cx);
+        adapter.set_tx_token_limit(Some(2));
+
+        assert!(Device::transmit(&mut adapter).is_some());
+        assert!(Device::transmit(&mut adapter).is_some());
+        assert!(Device::transmit(&mut adapter).is_none());
+        assert_eq!(adapter.inner.transmit_calls, 2);
+        assert!(adapter.take_tx_budget_exhausted());
+        assert!(!adapter.take_tx_exhausted());
+
+        adapter.set_tx_token_limit(Some(3));
+        assert!(Device::transmit(&mut adapter).is_some());
+        assert_eq!(adapter.inner.transmit_calls, 3);
+        assert!(!adapter.take_tx_budget_exhausted());
+    }
+
+    #[test]
+    fn hardware_tx_exhaustion_remains_distinct() {
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut driver = TestDriver {
+            transmit_calls: 0,
+            tx_available: false,
+        };
+        let mut adapter = adapter(&mut driver, &mut cx);
+        adapter.set_tx_token_limit(Some(1));
+
+        assert!(Device::transmit(&mut adapter).is_none());
+        assert_eq!(adapter.inner.transmit_calls, 1);
+        assert!(adapter.take_tx_exhausted());
+        assert!(!adapter.take_tx_budget_exhausted());
+    }
 }

@@ -57,6 +57,11 @@ features = ["defmt", "tcp", "udp", "raw", "dns", "icmp", "dhcpv4", "proto-ipv6",
 [features]
 default = ["auto-icmp-echo-reply"]
 
+## Publish one aggregate report after every cooperative runner poll.
+## This is intended for diagnostic firmware only: production builds compile
+## out both the callback and report construction.
+cooperative-scheduler-telemetry = []
+
 ## Enable defmt
 defmt = ["dep:defmt", "xarxa/defmt", "embassy-net-driver/defmt", "embassy-time/defmt", "heapless/defmt", "defmt?/ip_in_core"]
 ## Enable log
@@ -127,9 +132,9 @@ xarxa = {
 }
 
 embassy-net-driver = { version = "0.2.0", path = "../embassy-net-driver" }
-embassy-time = { version = "0.5.1", path = "../embassy-time" }
-embassy-futures = { version = "0.1.2", path = "../embassy-futures" }
-embassy-sync = { version = "0.8.0", path = "../embassy-sync" }
+embassy-time = { version = "0.5.1" }
+embassy-futures = { version = "0.1.2" }
+embassy-sync = { version = "0.8.0" }
 embedded-io-async = { version = "0.7.0" }
 
 managed = { version = "0.8.0", default-features = false, features = [ "map" ] }
