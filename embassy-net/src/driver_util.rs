@@ -1,8 +1,8 @@
 use core::task::Context;
 
-use embassy_net_driver::{Capabilities, Checksum, Driver, EgressQueuePolicy, PacketMeta, RxToken, TxToken};
+use embassy_net_driver::{Capabilities, Checksum, Driver, PacketMeta, RxToken, TxToken};
 #[cfg(feature = "tx-egress-metadata")]
-use embassy_net_driver::{EgressMeta, HardwareAddress, KeyedTxToken};
+use embassy_net_driver::{EgressAdmission, EgressKey, HardwareAddress};
 use xarxa::phy::{self, Medium};
 
 pub(crate) struct DriverAdapter<'d, 'c, T>
@@ -71,31 +71,31 @@ where
     }
 
     #[cfg(feature = "tx-egress-metadata")]
-    fn transmit_for(&mut self, egress: phy::EgressMeta) -> phy::KeyedTxToken<Self::TxToken<'_>> {
+    fn transmit_for(&mut self, egress: phy::EgressKey) -> phy::EgressAdmission<Self::TxToken<'_>> {
         if self.tx_token_limit.is_some_and(|limit| self.tx_tokens_issued >= limit) {
             self.tx_budget_exhausted = true;
-            return phy::KeyedTxToken::GlobalExhausted;
+            return phy::EgressAdmission::GlobalExhausted;
         }
         let destination = match egress.destination {
             phy::EgressHardwareAddress::Ethernet(address) => HardwareAddress::Ethernet(address),
             phy::EgressHardwareAddress::Ieee802154(address) => HardwareAddress::Ieee802154(address),
             phy::EgressHardwareAddress::Ip => HardwareAddress::Ip,
-            _ => return phy::KeyedTxToken::KeyDeferred,
+            _ => return phy::EgressAdmission::KeyDeferred,
         };
-        let request = EgressMeta {
+        let request = EgressKey {
             destination,
             traffic_class: egress.traffic_class,
         };
         match self.inner.transmit_for(unwrap!(self.cx.as_deref_mut()), request) {
-            KeyedTxToken::Granted(token) => {
+            EgressAdmission::Granted(token) => {
                 self.tx_tokens_issued = self.tx_tokens_issued.saturating_add(1);
-                phy::KeyedTxToken::Granted(TxTokenAdapter(token))
+                phy::EgressAdmission::Granted(TxTokenAdapter(token))
             }
-            KeyedTxToken::GlobalExhausted => {
+            EgressAdmission::GlobalExhausted => {
                 self.tx_exhausted = true;
-                phy::KeyedTxToken::GlobalExhausted
+                phy::EgressAdmission::GlobalExhausted
             }
-            KeyedTxToken::KeyDeferred => phy::KeyedTxToken::KeyDeferred,
+            EgressAdmission::KeyDeferred => phy::EgressAdmission::KeyDeferred,
         }
     }
 
@@ -130,22 +130,14 @@ where
         smolcaps
     }
 
-    fn egress_queue_policy(&mut self) -> phy::EgressQueuePolicy {
-        match self.inner.egress_queue_policy() {
-            EgressQueuePolicy::Fifo => phy::EgressQueuePolicy::Fifo,
-            EgressQueuePolicy::DestinationBurst { max_packets } => {
-                phy::EgressQueuePolicy::DestinationBurst { max_packets }
-            }
-            EgressQueuePolicy::ResolvedEgressBurst {
-                max_packets,
-                dispatch_quantum,
-                epoch,
-            } => phy::EgressQueuePolicy::ResolvedEgressBurst {
-                max_packets,
-                dispatch_quantum,
-                epoch,
-            },
-        }
+    fn egress_schedule(&mut self) -> Option<phy::EgressSchedule> {
+        self.inner.egress_schedule().map(|schedule| {
+            phy::EgressSchedule::new(
+                schedule.max_packets_per_key(),
+                schedule.dispatch_quantum(),
+                schedule.epoch(),
+            )
+        })
     }
 }
 
@@ -259,7 +251,9 @@ mod tests {
         #[cfg(feature = "tx-egress-metadata")]
         keyed_result: u8,
         #[cfg(feature = "tx-egress-metadata")]
-        last_egress: Option<embassy_net_driver::EgressMeta>,
+        last_egress: Option<embassy_net_driver::EgressKey>,
+        #[cfg(feature = "tx-egress-metadata")]
+        schedule: Option<embassy_net_driver::EgressSchedule>,
     }
 
     struct TestRxToken;
@@ -301,15 +295,20 @@ mod tests {
         fn transmit_for(
             &mut self,
             _cx: &mut Context<'_>,
-            egress: embassy_net_driver::EgressMeta,
-        ) -> embassy_net_driver::KeyedTxToken<Self::TxToken<'_>> {
+            egress: embassy_net_driver::EgressKey,
+        ) -> embassy_net_driver::EgressAdmission<Self::TxToken<'_>> {
             self.transmit_calls += 1;
             self.last_egress = Some(egress);
             match self.keyed_result {
-                0 => embassy_net_driver::KeyedTxToken::Granted(TestTxToken),
-                1 => embassy_net_driver::KeyedTxToken::GlobalExhausted,
-                _ => embassy_net_driver::KeyedTxToken::KeyDeferred,
+                0 => embassy_net_driver::EgressAdmission::Granted(TestTxToken),
+                1 => embassy_net_driver::EgressAdmission::GlobalExhausted,
+                _ => embassy_net_driver::EgressAdmission::KeyDeferred,
             }
+        }
+
+        #[cfg(feature = "tx-egress-metadata")]
+        fn egress_schedule(&mut self) -> Option<embassy_net_driver::EgressSchedule> {
+            self.schedule
         }
 
         fn link_state(&mut self, _cx: &mut Context<'_>) -> LinkState {
@@ -348,6 +347,8 @@ mod tests {
             keyed_result: 0,
             #[cfg(feature = "tx-egress-metadata")]
             last_egress: None,
+            #[cfg(feature = "tx-egress-metadata")]
+            schedule: None,
         };
         let mut adapter = adapter(&mut driver, &mut cx);
         adapter.set_tx_token_limit(Some(2));
@@ -376,6 +377,8 @@ mod tests {
             keyed_result: 0,
             #[cfg(feature = "tx-egress-metadata")]
             last_egress: None,
+            #[cfg(feature = "tx-egress-metadata")]
+            schedule: None,
         };
         let mut adapter = adapter(&mut driver, &mut cx);
         adapter.set_tx_token_limit(Some(1));
@@ -396,19 +399,24 @@ mod tests {
             tx_available: true,
             keyed_result: 0,
             last_egress: None,
+            schedule: Some(embassy_net_driver::EgressSchedule::new(
+                core::num::NonZeroU8::new(32).unwrap(),
+                core::num::NonZeroU8::new(4).unwrap(),
+                7,
+            )),
         };
         let mut adapter = adapter(&mut driver, &mut cx);
-        let request = phy::EgressMeta {
+        let request = phy::EgressKey {
             destination: phy::EgressHardwareAddress::Ethernet([2, 3, 4, 5, 6, 7]),
             traffic_class: 0x28,
         };
         assert!(matches!(
             Device::transmit_for(&mut adapter, request),
-            phy::KeyedTxToken::Granted(_)
+            phy::EgressAdmission::Granted(_)
         ));
         assert_eq!(
             adapter.inner.last_egress,
-            Some(embassy_net_driver::EgressMeta {
+            Some(embassy_net_driver::EgressKey {
                 destination: HardwareAddress::Ethernet([2, 3, 4, 5, 6, 7]),
                 traffic_class: 0x28,
             })
@@ -417,15 +425,20 @@ mod tests {
         adapter.inner.keyed_result = 2;
         assert!(matches!(
             Device::transmit_for(&mut adapter, request),
-            phy::KeyedTxToken::KeyDeferred
+            phy::EgressAdmission::KeyDeferred
         ));
         assert!(!adapter.take_tx_exhausted());
 
         adapter.inner.keyed_result = 1;
         assert!(matches!(
             Device::transmit_for(&mut adapter, request),
-            phy::KeyedTxToken::GlobalExhausted
+            phy::EgressAdmission::GlobalExhausted
         ));
         assert!(adapter.take_tx_exhausted());
+
+        let schedule = Device::egress_schedule(&mut adapter).unwrap();
+        assert_eq!(schedule.max_packets_per_key().get(), 32);
+        assert_eq!(schedule.dispatch_quantum().get(), 4);
+        assert_eq!(schedule.epoch(), 7);
     }
 }

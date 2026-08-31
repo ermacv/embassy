@@ -127,7 +127,7 @@ log = { version = "0.4.14", optional = true }
 
 xarxa = {
     git = "https://github.com/ermacv/xarxa.git",
-    rev = "92a73891dc99d8db620c5dcf43313d69da55514b",
+    rev = "87cb5de79ea676d7835ba8676f94a3010a4295b8",
     default-features = false,
     features = [
         "socket",
