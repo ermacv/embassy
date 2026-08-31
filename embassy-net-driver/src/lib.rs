@@ -70,15 +70,61 @@ pub struct PacketMeta {
     pub request_timestamp: bool,
 }
 
-/// Stack-resolved information available before a TX token emits its frame.
+/// Stack-resolved route available before device-specific egress classification.
 #[cfg(feature = "tx-egress-metadata")]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub struct EgressKey {
+pub struct EgressRoute {
     /// Link-layer destination selected after route and neighbor lookup.
     pub destination: HardwareAddress,
     /// Packet traffic class. Zero denotes the default best-effort class.
     pub traffic_class: u8,
+}
+
+/// Opaque driver-owned scheduling identity for one resolved egress route.
+///
+/// Link-layer destinations and physical radio peers are not equivalent on all
+/// devices. Drivers canonicalize [`EgressRoute`] before the stack groups
+/// queues or requests final TX backing.
+#[cfg(feature = "tx-egress-metadata")]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct EgressKey([u32; 4]);
+
+#[cfg(feature = "tx-egress-metadata")]
+impl EgressKey {
+    /// Construct one driver-owned scheduling key.
+    ///
+    /// A driver using keyed scheduling must keep this classification stable
+    /// for one [`EgressSchedule::epoch`] and advance the epoch whenever a route
+    /// could map to a different scheduling domain.
+    pub const fn from_words(words: [u32; 4]) -> Self {
+        Self(words)
+    }
+
+    /// Return the opaque representation for a stack adapter.
+    pub const fn words(self) -> [u32; 4] {
+        self.0
+    }
+
+    /// Losslessly classify a route for drivers without a narrower hardware
+    /// scheduling domain.
+    pub const fn from_route(route: EgressRoute) -> Self {
+        let (kind, low, high) = match route.destination {
+            HardwareAddress::Ethernet(address) => (
+                1,
+                u32::from_le_bytes([address[0], address[1], address[2], address[3]]),
+                u16::from_le_bytes([address[4], address[5]]) as u32,
+            ),
+            HardwareAddress::Ieee802154(address) => (
+                2,
+                u32::from_le_bytes([address[0], address[1], address[2], address[3]]),
+                u32::from_le_bytes([address[4], address[5], address[6], address[7]]),
+            ),
+            HardwareAddress::Ip => (3, 0, 0),
+        };
+        Self([kind, low, high, route.traffic_class as u32])
+    }
 }
 
 /// Result of requesting final TX backing for one resolved egress key.
@@ -230,7 +276,13 @@ pub trait Driver {
     /// if there is no free space and fail later.
     fn transmit(&mut self, cx: &mut Context) -> Option<Self::TxToken<'_>>;
 
-    /// Request a TX token for a stack-resolved link destination.
+    /// Canonicalize a stack-resolved route into the driver scheduling domain.
+    #[cfg(feature = "tx-egress-metadata")]
+    fn egress_key(&mut self, route: EgressRoute) -> EgressKey {
+        EgressKey::from_route(route)
+    }
+
+    /// Request a TX token for a driver-classified egress key.
     ///
     /// The default is the ordinary global admission contract. Key-aware
     /// drivers return [`EgressAdmission::KeyDeferred`] only for peer/VIF/TID
@@ -288,6 +340,11 @@ impl<T: ?Sized + Driver> Driver for &mut T {
         T::transmit(self, cx)
     }
     #[cfg(feature = "tx-egress-metadata")]
+    fn egress_key(&mut self, route: EgressRoute) -> EgressKey {
+        T::egress_key(self, route)
+    }
+
+    #[cfg(feature = "tx-egress-metadata")]
     fn transmit_for(&mut self, cx: &mut Context, egress: EgressKey) -> EgressAdmission<Self::TxToken<'_>> {
         T::transmit_for(self, cx, egress)
     }
@@ -307,6 +364,31 @@ impl<T: ?Sized + Driver> Driver for &mut T {
     }
     fn hardware_address(&self) -> HardwareAddress {
         T::hardware_address(self)
+    }
+}
+
+#[cfg(all(test, feature = "tx-egress-metadata"))]
+mod egress_tests {
+    use super::{EgressKey, EgressRoute, HardwareAddress};
+
+    #[test]
+    fn default_key_is_lossless_and_includes_traffic_class() {
+        let route = EgressRoute {
+            destination: HardwareAddress::Ethernet([0x02, 1, 2, 3, 4, 5]),
+            traffic_class: 6,
+        };
+        let other_destination = EgressRoute {
+            destination: HardwareAddress::Ethernet([0x02, 1, 2, 3, 4, 6]),
+            traffic_class: 6,
+        };
+        let other_class = EgressRoute {
+            traffic_class: 7,
+            ..route
+        };
+
+        assert_eq!(EgressKey::from_route(route), EgressKey::from_route(route));
+        assert_ne!(EgressKey::from_route(route), EgressKey::from_route(other_destination));
+        assert_ne!(EgressKey::from_route(route), EgressKey::from_route(other_class));
     }
 }
 

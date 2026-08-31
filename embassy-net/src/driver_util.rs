@@ -2,7 +2,7 @@ use core::task::Context;
 
 use embassy_net_driver::{Capabilities, Checksum, Driver, PacketMeta, RxToken, TxToken};
 #[cfg(feature = "tx-egress-metadata")]
-use embassy_net_driver::{EgressAdmission, EgressKey, HardwareAddress};
+use embassy_net_driver::{EgressAdmission, EgressKey, EgressRoute, HardwareAddress};
 use xarxa::phy::{self, Medium};
 
 pub(crate) struct DriverAdapter<'d, 'c, T>
@@ -71,21 +71,27 @@ where
     }
 
     #[cfg(feature = "tx-egress-metadata")]
+    fn egress_key(&mut self, route: phy::EgressRoute) -> phy::EgressKey {
+        let destination = match route.destination {
+            phy::EgressHardwareAddress::Ethernet(address) => HardwareAddress::Ethernet(address),
+            phy::EgressHardwareAddress::Ieee802154(address) => HardwareAddress::Ieee802154(address),
+            phy::EgressHardwareAddress::Ip => HardwareAddress::Ip,
+            _ => return phy::EgressKey::from_route(route),
+        };
+        let key = self.inner.egress_key(EgressRoute {
+            destination,
+            traffic_class: route.traffic_class,
+        });
+        phy::EgressKey::from_words(key.words())
+    }
+
+    #[cfg(feature = "tx-egress-metadata")]
     fn transmit_for(&mut self, egress: phy::EgressKey) -> phy::EgressAdmission<Self::TxToken<'_>> {
         if self.tx_token_limit.is_some_and(|limit| self.tx_tokens_issued >= limit) {
             self.tx_budget_exhausted = true;
             return phy::EgressAdmission::GlobalExhausted;
         }
-        let destination = match egress.destination {
-            phy::EgressHardwareAddress::Ethernet(address) => HardwareAddress::Ethernet(address),
-            phy::EgressHardwareAddress::Ieee802154(address) => HardwareAddress::Ieee802154(address),
-            phy::EgressHardwareAddress::Ip => HardwareAddress::Ip,
-            _ => return phy::EgressAdmission::KeyDeferred,
-        };
-        let request = EgressKey {
-            destination,
-            traffic_class: egress.traffic_class,
-        };
+        let request = EgressKey::from_words(egress.words());
         match self.inner.transmit_for(unwrap!(self.cx.as_deref_mut()), request) {
             EgressAdmission::Granted(token) => {
                 self.tx_tokens_issued = self.tx_tokens_issued.saturating_add(1);
@@ -292,6 +298,18 @@ mod tests {
         }
 
         #[cfg(feature = "tx-egress-metadata")]
+        fn egress_key(&mut self, route: embassy_net_driver::EgressRoute) -> embassy_net_driver::EgressKey {
+            assert_eq!(
+                route,
+                embassy_net_driver::EgressRoute {
+                    destination: HardwareAddress::Ethernet([2, 3, 4, 5, 6, 7]),
+                    traffic_class: 0x28,
+                }
+            );
+            embassy_net_driver::EgressKey::from_words([11, 13, 17, 19])
+        }
+
+        #[cfg(feature = "tx-egress-metadata")]
         fn transmit_for(
             &mut self,
             _cx: &mut Context<'_>,
@@ -391,7 +409,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "tx-egress-metadata")]
-    fn keyed_admission_preserves_destination_and_refusal_class() {
+    fn keyed_admission_preserves_driver_classification_and_refusal_class() {
         let waker = Waker::noop();
         let mut cx = Context::from_waker(waker);
         let mut driver = TestDriver {
@@ -406,20 +424,19 @@ mod tests {
             )),
         };
         let mut adapter = adapter(&mut driver, &mut cx);
-        let request = phy::EgressKey {
+        let route = phy::EgressRoute {
             destination: phy::EgressHardwareAddress::Ethernet([2, 3, 4, 5, 6, 7]),
             traffic_class: 0x28,
         };
+        let request = Device::egress_key(&mut adapter, route);
+        assert_eq!(request, phy::EgressKey::from_words([11, 13, 17, 19]));
         assert!(matches!(
             Device::transmit_for(&mut adapter, request),
             phy::EgressAdmission::Granted(_)
         ));
         assert_eq!(
             adapter.inner.last_egress,
-            Some(embassy_net_driver::EgressKey {
-                destination: HardwareAddress::Ethernet([2, 3, 4, 5, 6, 7]),
-                traffic_class: 0x28,
-            })
+            Some(embassy_net_driver::EgressKey::from_words([11, 13, 17, 19]))
         );
 
         adapter.inner.keyed_result = 2;
