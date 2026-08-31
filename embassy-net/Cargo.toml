@@ -112,8 +112,12 @@ slaac = ["proto-ipv6", "multicast", "xarxa/proto-ipv6-slaac"]
 std = ["xarxa/std"]
 ## Enable xarxa alloc feature (necessary if using "managed" crate alloc feature)
 alloc = ["xarxa/alloc"]
+## Keep enough resolved neighbors for the ESP32-S31 SoftAP client limit plus
+## the interface's group/control destination.
+iface-neighbor-cache-count-16 = ["xarxa/iface-neighbor-cache-count-16"]
 ## Enable xarxa packetmeta-id feature
 packetmeta-id = [ "xarxa/packetmeta-id", "embassy-net-driver/packetmeta-id" ]
+tx-egress-metadata = [ "xarxa/tx-egress-metadata", "embassy-net-driver/tx-egress-metadata" ]
 packetmeta-timestamp = [ "xarxa/packetmeta-timestamp", "embassy-net-driver/packetmeta-timestamp" ]
 
 [dependencies]
@@ -123,7 +127,7 @@ log = { version = "0.4.14", optional = true }
 
 xarxa = {
     git = "https://github.com/ermacv/xarxa.git",
-    rev = "77b371632d259c1c5f57b766e297e8c7149afac1",
+    rev = "92a73891dc99d8db620c5dcf43313d69da55514b",
     default-features = false,
     features = [
         "socket",

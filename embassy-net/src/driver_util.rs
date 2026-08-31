@@ -1,6 +1,8 @@
 use core::task::Context;
 
-use embassy_net_driver::{Capabilities, Checksum, Driver, PacketMeta, RxToken, TxToken};
+use embassy_net_driver::{Capabilities, Checksum, Driver, EgressQueuePolicy, PacketMeta, RxToken, TxToken};
+#[cfg(feature = "tx-egress-metadata")]
+use embassy_net_driver::{EgressMeta, HardwareAddress, KeyedTxToken};
 use xarxa::phy::{self, Medium};
 
 pub(crate) struct DriverAdapter<'d, 'c, T>
@@ -68,6 +70,35 @@ where
         token
     }
 
+    #[cfg(feature = "tx-egress-metadata")]
+    fn transmit_for(&mut self, egress: phy::EgressMeta) -> phy::KeyedTxToken<Self::TxToken<'_>> {
+        if self.tx_token_limit.is_some_and(|limit| self.tx_tokens_issued >= limit) {
+            self.tx_budget_exhausted = true;
+            return phy::KeyedTxToken::GlobalExhausted;
+        }
+        let destination = match egress.destination {
+            phy::EgressHardwareAddress::Ethernet(address) => HardwareAddress::Ethernet(address),
+            phy::EgressHardwareAddress::Ieee802154(address) => HardwareAddress::Ieee802154(address),
+            phy::EgressHardwareAddress::Ip => HardwareAddress::Ip,
+            _ => return phy::KeyedTxToken::KeyDeferred,
+        };
+        let request = EgressMeta {
+            destination,
+            traffic_class: egress.traffic_class,
+        };
+        match self.inner.transmit_for(unwrap!(self.cx.as_deref_mut()), request) {
+            KeyedTxToken::Granted(token) => {
+                self.tx_tokens_issued = self.tx_tokens_issued.saturating_add(1);
+                phy::KeyedTxToken::Granted(TxTokenAdapter(token))
+            }
+            KeyedTxToken::GlobalExhausted => {
+                self.tx_exhausted = true;
+                phy::KeyedTxToken::GlobalExhausted
+            }
+            KeyedTxToken::KeyDeferred => phy::KeyedTxToken::KeyDeferred,
+        }
+    }
+
     /// Get a description of device capabilities.
     fn capabilities(&self) -> phy::DeviceCapabilities {
         fn convert(c: Checksum) -> phy::Checksum {
@@ -97,6 +128,24 @@ where
         }
 
         smolcaps
+    }
+
+    fn egress_queue_policy(&mut self) -> phy::EgressQueuePolicy {
+        match self.inner.egress_queue_policy() {
+            EgressQueuePolicy::Fifo => phy::EgressQueuePolicy::Fifo,
+            EgressQueuePolicy::DestinationBurst { max_packets } => {
+                phy::EgressQueuePolicy::DestinationBurst { max_packets }
+            }
+            EgressQueuePolicy::ResolvedEgressBurst {
+                max_packets,
+                dispatch_quantum,
+                epoch,
+            } => phy::EgressQueuePolicy::ResolvedEgressBurst {
+                max_packets,
+                dispatch_quantum,
+                epoch,
+            },
+        }
     }
 }
 
@@ -207,6 +256,10 @@ mod tests {
     struct TestDriver {
         transmit_calls: u32,
         tx_available: bool,
+        #[cfg(feature = "tx-egress-metadata")]
+        keyed_result: u8,
+        #[cfg(feature = "tx-egress-metadata")]
+        last_egress: Option<embassy_net_driver::EgressMeta>,
     }
 
     struct TestRxToken;
@@ -244,6 +297,21 @@ mod tests {
             self.tx_available.then_some(TestTxToken)
         }
 
+        #[cfg(feature = "tx-egress-metadata")]
+        fn transmit_for(
+            &mut self,
+            _cx: &mut Context<'_>,
+            egress: embassy_net_driver::EgressMeta,
+        ) -> embassy_net_driver::KeyedTxToken<Self::TxToken<'_>> {
+            self.transmit_calls += 1;
+            self.last_egress = Some(egress);
+            match self.keyed_result {
+                0 => embassy_net_driver::KeyedTxToken::Granted(TestTxToken),
+                1 => embassy_net_driver::KeyedTxToken::GlobalExhausted,
+                _ => embassy_net_driver::KeyedTxToken::KeyDeferred,
+            }
+        }
+
         fn link_state(&mut self, _cx: &mut Context<'_>) -> LinkState {
             LinkState::Up
         }
@@ -276,6 +344,10 @@ mod tests {
         let mut driver = TestDriver {
             transmit_calls: 0,
             tx_available: true,
+            #[cfg(feature = "tx-egress-metadata")]
+            keyed_result: 0,
+            #[cfg(feature = "tx-egress-metadata")]
+            last_egress: None,
         };
         let mut adapter = adapter(&mut driver, &mut cx);
         adapter.set_tx_token_limit(Some(2));
@@ -300,6 +372,10 @@ mod tests {
         let mut driver = TestDriver {
             transmit_calls: 0,
             tx_available: false,
+            #[cfg(feature = "tx-egress-metadata")]
+            keyed_result: 0,
+            #[cfg(feature = "tx-egress-metadata")]
+            last_egress: None,
         };
         let mut adapter = adapter(&mut driver, &mut cx);
         adapter.set_tx_token_limit(Some(1));
@@ -308,5 +384,48 @@ mod tests {
         assert_eq!(adapter.inner.transmit_calls, 1);
         assert!(adapter.take_tx_exhausted());
         assert!(!adapter.take_tx_budget_exhausted());
+    }
+
+    #[test]
+    #[cfg(feature = "tx-egress-metadata")]
+    fn keyed_admission_preserves_destination_and_refusal_class() {
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut driver = TestDriver {
+            transmit_calls: 0,
+            tx_available: true,
+            keyed_result: 0,
+            last_egress: None,
+        };
+        let mut adapter = adapter(&mut driver, &mut cx);
+        let request = phy::EgressMeta {
+            destination: phy::EgressHardwareAddress::Ethernet([2, 3, 4, 5, 6, 7]),
+            traffic_class: 0x28,
+        };
+        assert!(matches!(
+            Device::transmit_for(&mut adapter, request),
+            phy::KeyedTxToken::Granted(_)
+        ));
+        assert_eq!(
+            adapter.inner.last_egress,
+            Some(embassy_net_driver::EgressMeta {
+                destination: HardwareAddress::Ethernet([2, 3, 4, 5, 6, 7]),
+                traffic_class: 0x28,
+            })
+        );
+
+        adapter.inner.keyed_result = 2;
+        assert!(matches!(
+            Device::transmit_for(&mut adapter, request),
+            phy::KeyedTxToken::KeyDeferred
+        ));
+        assert!(!adapter.take_tx_exhausted());
+
+        adapter.inner.keyed_result = 1;
+        assert!(matches!(
+            Device::transmit_for(&mut adapter, request),
+            phy::KeyedTxToken::GlobalExhausted
+        ));
+        assert!(adapter.take_tx_exhausted());
     }
 }

@@ -117,10 +117,12 @@ impl<'a> UdpSocket<'a> {
             let rx_buffer: &'static mut [u8] = unsafe { mem::transmute(rx_buffer) };
             let tx_meta: &'static mut [PacketMetadata] = unsafe { mem::transmute(tx_meta) };
             let tx_buffer: &'static mut [u8] = unsafe { mem::transmute(tx_buffer) };
-            i.sockets.add(udp::Socket::new(
-                udp::PacketBuffer::new(rx_meta, rx_buffer),
-                udp::PacketBuffer::new(tx_meta, tx_buffer),
-            ))
+            let rx_packets = udp::PacketBuffer::new(rx_meta, rx_buffer);
+            #[cfg(feature = "tx-egress-metadata")]
+            let tx_packets = udp::PacketBuffer::new_indexed_slots(tx_meta, tx_buffer);
+            #[cfg(not(feature = "tx-egress-metadata"))]
+            let tx_packets = udp::PacketBuffer::new(tx_meta, tx_buffer);
+            i.sockets.add(udp::Socket::new(rx_packets, tx_packets))
         });
 
         Self { stack, handle }
@@ -156,7 +158,7 @@ impl<'a> UdpSocket<'a> {
         self.stack.with_mut(|i| {
             let socket = i.sockets.get_mut::<udp::Socket>(self.handle);
             let res = f(socket, &mut i.iface);
-            i.waker.wake();
+            i.wake_for_socket_change();
             res
         })
     }

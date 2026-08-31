@@ -10,6 +10,12 @@
 #[cfg(not(any(feature = "proto-ipv4", feature = "proto-ipv6")))]
 compile_error!("You must enable at least one of the following features: proto-ipv4, proto-ipv6");
 
+#[cfg(feature = "iface-neighbor-cache-count-16")]
+const _: () = assert!(
+    xarxa::config::IFACE_NEIGHBOR_CACHE_COUNT >= 16,
+    "the 16-neighbor Embassy feature must reach Xarxa"
+);
+
 // This mod MUST go first, so that the others see its macros.
 pub(crate) mod fmt;
 
@@ -32,6 +38,8 @@ use core::cell::RefCell;
 use core::future::{Future, poll_fn};
 use core::mem::MaybeUninit;
 use core::pin::pin;
+#[cfg(feature = "cooperative-scheduler-telemetry")]
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll};
 
 pub use embassy_net_driver as driver;
@@ -77,6 +85,28 @@ use cooperative::{CooperativePollState, DIRECTION_QUANTUM, EGRESS_LIMIT, take_st
 
 const LOCAL_PORT_MIN: u16 = 1025;
 const LOCAL_PORT_MAX: u16 = 65535;
+
+#[cfg(feature = "cooperative-scheduler-telemetry")]
+static SUPPRESS_BLOCKED_EGRESS_SOCKET_WAKES: AtomicBool = AtomicBool::new(true);
+
+/// Select whether cooperative egress suppresses socket-originated wakes while
+/// a driver-credit edge is already the only event that can make TX progress.
+///
+/// This switch exists only for same-image qualification. Normal builds always
+/// use the work-conserving suppression policy.
+#[cfg(feature = "cooperative-scheduler-telemetry")]
+pub fn configure_blocked_egress_socket_wake_suppression(enabled: bool) {
+    SUPPRESS_BLOCKED_EGRESS_SOCKET_WAKES.store(enabled, Ordering::Release);
+}
+
+fn blocked_egress_socket_wake_suppression_enabled() -> bool {
+    #[cfg(feature = "cooperative-scheduler-telemetry")]
+    {
+        return SUPPRESS_BLOCKED_EGRESS_SOCKET_WAKES.load(Ordering::Acquire);
+    }
+    #[cfg(not(feature = "cooperative-scheduler-telemetry"))]
+    true
+}
 #[cfg(feature = "dns")]
 const MAX_QUERIES: usize = 4;
 #[cfg(feature = "dhcpv4-ntp")]
@@ -345,6 +375,7 @@ pub(crate) struct Inner {
     #[cfg(feature = "packetmeta-timestamp")]
     timestamps: Channel<NoopRawMutex, TxTimestamp, 5>,
     cooperative_starts_with_ingress: bool,
+    cooperative_socket_egress_wake_gated: bool,
 }
 
 fn _assert_covariant<'a, 'b: 'a>(x: Stack<'b>) -> Stack<'a> {
@@ -426,6 +457,7 @@ pub fn new<'d, D: Driver, const SOCK: usize>(
         #[cfg(feature = "packetmeta-timestamp")]
         timestamps: Channel::new(),
         cooperative_starts_with_ingress: true,
+        cooperative_socket_egress_wake_gated: false,
     };
 
     #[cfg(feature = "proto-ipv4")]
@@ -760,6 +792,12 @@ impl<'d> Stack<'d> {
 }
 
 impl Inner {
+    pub(crate) fn wake_for_socket_change(&mut self) {
+        if !self.cooperative_socket_egress_wake_gated || !blocked_egress_socket_wake_suppression_enabled() {
+            self.waker.wake();
+        }
+    }
+
     #[cfg(feature = "slaac")]
     fn get_link_local_address(&self) -> IpCidr {
         let ll_prefix = Ipv6Cidr::new(Ipv6Cidr::LINK_LOCAL_PREFIX.address(), 64);
@@ -1079,12 +1117,14 @@ impl Inner {
                 observer(state.report());
             }
             let self_wake = state.should_self_wake();
-            cooperative_state = Some((state.egress_blocked, self_wake));
+            cooperative_state = Some((state.egress_blocked, self_wake, state.gate_socket_egress_wake()));
         } else {
             self.iface.poll(timestamp, &mut smoldev, &mut self.sockets);
         }
-        let (tx_exhausted, cooperative_self_wake) = cooperative_state.unwrap_or((smoldev.tx_exhausted, false));
+        let (tx_exhausted, cooperative_self_wake, socket_egress_wake_gated) =
+            cooperative_state.unwrap_or((smoldev.tx_exhausted, false, false));
         drop(smoldev);
+        self.cooperative_socket_egress_wake_gated = socket_egress_wake_gated;
         if cooperative_self_wake {
             cx.waker().wake_by_ref();
         }

@@ -113,6 +113,14 @@ impl CooperativePollState {
             || (!self.egress_drained && !self.egress_blocked && self.egress_tx_tokens >= u32::from(EGRESS_LIMIT))
     }
 
+    /// Socket producers do not need to wake this runner while egress is
+    /// waiting for a real driver-credit edge. Budget exhaustion is gated too:
+    /// the already-scheduled cooperative self-wake will either continue the
+    /// bounded drain or prove that the device is exhausted.
+    pub(crate) fn gate_socket_egress_wake(&self) -> bool {
+        self.egress_blocked || (!self.egress_drained && self.egress_tx_tokens >= u32::from(EGRESS_LIMIT))
+    }
+
     #[cfg(feature = "cooperative-scheduler-telemetry")]
     pub(crate) fn report(&self) -> CooperativePollReport {
         let ingress_budget_exhausted = !self.ingress_drained && self.ingress_packets >= INGRESS_LIMIT;
@@ -174,6 +182,32 @@ mod tests {
         }
         assert!(!egress.can_poll());
         assert!(egress.should_self_wake());
+    }
+
+    #[test]
+    fn socket_egress_wakes_are_gated_only_until_the_scheduled_credit_probe() {
+        let mut blocked = CooperativePollState::new(false);
+        blocked.ingress_drained = true;
+        blocked.record_egress(PollResult::None, 0, true, false);
+        assert!(blocked.gate_socket_egress_wake());
+
+        let mut budgeted = CooperativePollState::new(false);
+        budgeted.ingress_drained = true;
+        for _ in 0..u32::from(EGRESS_LIMIT) / u32::from(DIRECTION_QUANTUM) {
+            budgeted.record_egress(
+                PollResult::SocketStateChanged,
+                u32::from(DIRECTION_QUANTUM),
+                false,
+                true,
+            );
+        }
+        assert!(budgeted.should_self_wake());
+        assert!(budgeted.gate_socket_egress_wake());
+
+        let mut drained = CooperativePollState::new(false);
+        drained.ingress_drained = true;
+        drained.record_egress(PollResult::None, 0, false, false);
+        assert!(!drained.gate_socket_egress_wake());
     }
 
     #[test]

@@ -22,7 +22,7 @@ use core::task::Context;
 /// fields a non-breaking change.
 ///
 /// ```rust
-/// let mut meta = xarxa_driver::PacketMeta::default();
+/// let mut meta = embassy_net_driver::PacketMeta::default();
 /// #[cfg(feature = "packetmeta-id")]
 /// {
 ///     meta.id = 15;
@@ -66,6 +66,81 @@ pub struct PacketMeta {
     /// handful of transmit timestamp slots. Requesting a timestamp for every packet
     /// will cause most of them to be dropped.
     pub request_timestamp: bool,
+}
+
+/// Stack-resolved information available before a TX token emits its frame.
+#[cfg(feature = "tx-egress-metadata")]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct EgressMeta {
+    /// Link-layer destination selected after route and neighbor lookup.
+    pub destination: HardwareAddress,
+    /// Packet traffic class. Zero denotes the default best-effort class.
+    pub traffic_class: u8,
+}
+
+/// Result of requesting final TX backing for one resolved egress key.
+///
+/// Global storage pressure and a key-specific scheduler defer have different
+/// queue semantics and must never be collapsed into one `None` result.
+#[cfg(feature = "tx-egress-metadata")]
+#[derive(Debug)]
+pub enum KeyedTxToken<T> {
+    /// Final backing and one affine admission credit were granted.
+    Granted(T),
+    /// No final TX backing is currently available for any key.
+    GlobalExhausted,
+    /// This key is valid but currently outside its scheduler/admission grant.
+    KeyDeferred,
+}
+
+#[cfg(feature = "tx-egress-metadata")]
+impl<T> KeyedTxToken<T> {
+    /// Transform a granted token without changing either refusal reason.
+    pub fn map<U>(self, map: impl FnOnce(T) -> U) -> KeyedTxToken<U> {
+        match self {
+            Self::Granted(token) => KeyedTxToken::Granted(map(token)),
+            Self::GlobalExhausted => KeyedTxToken::GlobalExhausted,
+            Self::KeyDeferred => KeyedTxToken::KeyDeferred,
+        }
+    }
+}
+
+/// Ordering policy applied by the network stack before it requests a final TX
+/// token from the driver.
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum EgressQueuePolicy {
+    /// Preserve the socket's global FIFO order.
+    #[default]
+    Fifo,
+    /// Emit a bounded run for one destination before selecting another.
+    DestinationBurst {
+        /// Maximum number of packets selected for one destination before the
+        /// stack rotates to another queued destination.
+        max_packets: u8,
+    },
+    /// Emit a bounded run for one stack-resolved link destination and traffic
+    /// class before selecting another.
+    ///
+    /// Several routed IP destinations may resolve to the same link key. They
+    /// consequently share one burst instead of being treated as independent
+    /// device queues.
+    ResolvedEgressBurst {
+        /// Maximum number of packets selected for one resolved key before the
+        /// stack rotates to another queued key.
+        max_packets: u8,
+        /// Maximum packets emitted from one selected socket in one interface
+        /// egress pass. Zero is treated as one by the stack.
+        dispatch_quantum: u8,
+        /// Driver-owned lifecycle epoch for this scheduling domain.
+        ///
+        /// A stack must discard every retained resolved-key cursor when this
+        /// value changes. This makes role restart and reassociation reset
+        /// deterministic even when no stack poll observes the intervening
+        /// link-down state.
+        epoch: u32,
+    },
 }
 
 /// The timestamp of a transmitted packet, reported by [`Device::poll_tx_timestamp`].
@@ -149,6 +224,20 @@ pub trait Driver {
     /// if there is no free space and fail later.
     fn transmit(&mut self, cx: &mut Context) -> Option<Self::TxToken<'_>>;
 
+    /// Request a TX token for a stack-resolved link destination.
+    ///
+    /// The default is the ordinary global admission contract. Key-aware
+    /// drivers return [`KeyedTxToken::KeyDeferred`] only for peer/VIF/TID
+    /// policy; an empty global pool is [`KeyedTxToken::GlobalExhausted`].
+    #[cfg(feature = "tx-egress-metadata")]
+    #[allow(unused_variables)]
+    fn transmit_for(&mut self, cx: &mut Context, egress: EgressMeta) -> KeyedTxToken<Self::TxToken<'_>> {
+        match self.transmit(cx) {
+            Some(token) => KeyedTxToken::Granted(token),
+            None => KeyedTxToken::GlobalExhausted,
+        }
+    }
+
     /// Get the link state.
     ///
     /// This function must return the current link state of the device, and wake `cx.waker()` when
@@ -157,6 +246,15 @@ pub trait Driver {
 
     /// Get a description of device capabilities.
     fn capabilities(&self) -> Capabilities;
+
+    /// Select packet ordering before [`Self::transmit`] allocates final driver
+    /// backing.
+    ///
+    /// The default preserves historical FIFO behavior. This is a selection
+    /// policy, not a buffer reservation or authorization to transmit to a peer.
+    fn egress_queue_policy(&mut self) -> EgressQueuePolicy {
+        EgressQueuePolicy::Fifo
+    }
 
     /// Get the device's hardware address.
     ///
@@ -183,11 +281,19 @@ impl<T: ?Sized + Driver> Driver for &mut T {
     fn transmit(&mut self, cx: &mut Context) -> Option<Self::TxToken<'_>> {
         T::transmit(self, cx)
     }
+    #[cfg(feature = "tx-egress-metadata")]
+    fn transmit_for(&mut self, cx: &mut Context, egress: EgressMeta) -> KeyedTxToken<Self::TxToken<'_>> {
+        T::transmit_for(self, cx, egress)
+    }
     fn receive(&mut self, cx: &mut Context) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         T::receive(self, cx)
     }
     fn capabilities(&self) -> Capabilities {
         T::capabilities(self)
+    }
+
+    fn egress_queue_policy(&mut self) -> EgressQueuePolicy {
+        T::egress_queue_policy(self)
     }
     fn link_state(&mut self, cx: &mut Context) -> LinkState {
         T::link_state(self, cx)
