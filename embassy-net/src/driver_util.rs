@@ -2,7 +2,10 @@ use core::task::Context;
 
 use embassy_net_driver::{Capabilities, Checksum, Driver, PacketMeta, RxToken, TxToken};
 #[cfg(feature = "tx-egress-metadata")]
-use embassy_net_driver::{EgressAdmission, EgressKey, EgressRoute, HardwareAddress};
+use embassy_net_driver::{
+    EgressAdmission, EgressDemand, EgressDemandId, EgressDemandLevel, EgressDemandUpdate, EgressKey, EgressRoute,
+    HardwareAddress,
+};
 use xarxa::phy::{self, Medium};
 
 pub(crate) struct DriverAdapter<'d, 'c, T>
@@ -145,6 +148,23 @@ where
             )
         })
     }
+
+    #[cfg(feature = "tx-egress-metadata")]
+    fn update_egress_demand(&mut self, update: phy::EgressDemandUpdate) {
+        let update = match update {
+            phy::EgressDemandUpdate::Reset { schedule_epoch } => EgressDemandUpdate::Reset { schedule_epoch },
+            phy::EgressDemandUpdate::Active(demand) => EgressDemandUpdate::Active(EgressDemand::new(
+                EgressDemandId::new(demand.id().schedule_epoch(), demand.id().activation()),
+                EgressKey::from_words(demand.key().words()),
+                EgressDemandLevel::new(demand.level().ready_units(), demand.level().horizon_ready()),
+            )),
+            phy::EgressDemandUpdate::Inactive { id, key } => EgressDemandUpdate::Inactive {
+                id: EgressDemandId::new(id.schedule_epoch(), id.activation()),
+                key: EgressKey::from_words(key.words()),
+            },
+        };
+        self.inner.update_egress_demand(unwrap!(self.cx.as_deref_mut()), update);
+    }
 }
 
 pub(crate) struct RxTokenAdapter<T>(T)
@@ -260,6 +280,8 @@ mod tests {
         last_egress: Option<embassy_net_driver::EgressKey>,
         #[cfg(feature = "tx-egress-metadata")]
         schedule: Option<embassy_net_driver::EgressSchedule>,
+        #[cfg(feature = "tx-egress-metadata")]
+        last_demand: Option<embassy_net_driver::EgressDemandUpdate>,
     }
 
     struct TestRxToken;
@@ -329,6 +351,11 @@ mod tests {
             self.schedule
         }
 
+        #[cfg(feature = "tx-egress-metadata")]
+        fn update_egress_demand(&mut self, _cx: &mut Context<'_>, update: embassy_net_driver::EgressDemandUpdate) {
+            self.last_demand = Some(update);
+        }
+
         fn link_state(&mut self, _cx: &mut Context<'_>) -> LinkState {
             LinkState::Up
         }
@@ -367,6 +394,8 @@ mod tests {
             last_egress: None,
             #[cfg(feature = "tx-egress-metadata")]
             schedule: None,
+            #[cfg(feature = "tx-egress-metadata")]
+            last_demand: None,
         };
         let mut adapter = adapter(&mut driver, &mut cx);
         adapter.set_tx_token_limit(Some(2));
@@ -397,6 +426,8 @@ mod tests {
             last_egress: None,
             #[cfg(feature = "tx-egress-metadata")]
             schedule: None,
+            #[cfg(feature = "tx-egress-metadata")]
+            last_demand: None,
         };
         let mut adapter = adapter(&mut driver, &mut cx);
         adapter.set_tx_token_limit(Some(1));
@@ -422,6 +453,7 @@ mod tests {
                 core::num::NonZeroU8::new(4).unwrap(),
                 7,
             )),
+            last_demand: None,
         };
         let mut adapter = adapter(&mut driver, &mut cx);
         let route = phy::EgressRoute {
@@ -457,5 +489,44 @@ mod tests {
         assert_eq!(schedule.max_packets_per_key().get(), 32);
         assert_eq!(schedule.dispatch_quantum().get(), 4);
         assert_eq!(schedule.epoch(), 7);
+    }
+
+    #[test]
+    #[cfg(feature = "tx-egress-metadata")]
+    fn egress_demand_identity_and_level_cross_the_stack_adapter() {
+        use core::num::{NonZeroU16, NonZeroU32};
+
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut driver = TestDriver {
+            transmit_calls: 0,
+            tx_available: true,
+            keyed_result: 0,
+            last_egress: None,
+            schedule: None,
+            last_demand: None,
+        };
+        let mut adapter = adapter(&mut driver, &mut cx);
+        let id = phy::EgressDemandId::new(7, NonZeroU32::new(11).unwrap());
+        let key = phy::EgressKey::from_words([2, 3, 5, 7]);
+        Device::update_egress_demand(
+            &mut adapter,
+            phy::EgressDemandUpdate::Active(phy::EgressDemand::new(
+                id,
+                key,
+                phy::EgressDemandLevel::new(NonZeroU16::new(13).unwrap(), true),
+            )),
+        );
+
+        assert_eq!(
+            adapter.inner.last_demand,
+            Some(embassy_net_driver::EgressDemandUpdate::Active(
+                embassy_net_driver::EgressDemand::new(
+                    embassy_net_driver::EgressDemandId::new(7, NonZeroU32::new(11).unwrap()),
+                    embassy_net_driver::EgressKey::from_words([2, 3, 5, 7]),
+                    embassy_net_driver::EgressDemandLevel::new(NonZeroU16::new(13).unwrap(), true),
+                )
+            ))
+        );
     }
 }

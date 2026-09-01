@@ -4,7 +4,7 @@
 #![doc = include_str!("../README.md")]
 
 #[cfg(feature = "tx-egress-metadata")]
-use core::num::NonZeroU8;
+use core::num::{NonZeroU8, NonZeroU16, NonZeroU32};
 use core::task::Context;
 
 /// Metadata associated to a packet.
@@ -195,6 +195,120 @@ impl EgressSchedule {
     }
 }
 
+/// Stable identity of one nonempty stack-owned egress-demand lifetime.
+#[cfg(feature = "tx-egress-metadata")]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct EgressDemandId {
+    schedule_epoch: u32,
+    activation: NonZeroU32,
+}
+
+#[cfg(feature = "tx-egress-metadata")]
+impl EgressDemandId {
+    /// Construct one demand identity.
+    pub const fn new(schedule_epoch: u32, activation: NonZeroU32) -> Self {
+        Self {
+            schedule_epoch,
+            activation,
+        }
+    }
+
+    /// Driver-owned route-classification epoch.
+    pub const fn schedule_epoch(self) -> u32 {
+        self.schedule_epoch
+    }
+
+    /// Stack-owned nonempty-lifetime serial.
+    pub const fn activation(self) -> NonZeroU32 {
+        self.activation
+    }
+}
+
+/// Coalesced amount of currently visible work for one egress demand.
+#[cfg(feature = "tx-egress-metadata")]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct EgressDemandLevel {
+    ready_units: NonZeroU16,
+    horizon_ready: bool,
+}
+
+#[cfg(feature = "tx-egress-metadata")]
+impl EgressDemandLevel {
+    /// Construct one nonempty demand level.
+    pub const fn new(ready_units: NonZeroU16, horizon_ready: bool) -> Self {
+        Self {
+            ready_units,
+            horizon_ready,
+        }
+    }
+
+    /// Bounded point-in-time work estimate.
+    pub const fn ready_units(self) -> NonZeroU16 {
+        self.ready_units
+    }
+
+    /// Whether the stack's useful queueing horizon is currently ready.
+    pub const fn horizon_ready(self) -> bool {
+        self.horizon_ready
+    }
+}
+
+/// Identity and current level of one active opaque egress key.
+#[cfg(feature = "tx-egress-metadata")]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct EgressDemand {
+    id: EgressDemandId,
+    key: EgressKey,
+    level: EgressDemandLevel,
+}
+
+#[cfg(feature = "tx-egress-metadata")]
+impl EgressDemand {
+    /// Construct one active demand observation.
+    pub const fn new(id: EgressDemandId, key: EgressKey, level: EgressDemandLevel) -> Self {
+        Self { id, key, level }
+    }
+
+    /// Nonempty-lifetime identity.
+    pub const fn id(self) -> EgressDemandId {
+        self.id
+    }
+
+    /// Opaque driver scheduling key.
+    pub const fn key(self) -> EgressKey {
+        self.key
+    }
+
+    /// Coalesced queue level.
+    pub const fn level(self) -> EgressDemandLevel {
+        self.level
+    }
+}
+
+/// One ordered stack-to-driver egress-demand transition.
+#[cfg(feature = "tx-egress-metadata")]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum EgressDemandUpdate {
+    /// Discard every demand from an older route-classification epoch.
+    Reset {
+        /// New driver-owned scheduling epoch.
+        schedule_epoch: u32,
+    },
+    /// Activate a key or update its coalesced useful level.
+    Active(EgressDemand),
+    /// End one exact nonempty lifetime.
+    Inactive {
+        /// Terminal demand identity.
+        id: EgressDemandId,
+        /// Opaque key retained for direct consumer lookup.
+        key: EgressKey,
+    },
+}
+
 /// The timestamp of a transmitted packet, reported by [`Device::poll_tx_timestamp`].
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -314,6 +428,14 @@ pub trait Driver {
         None
     }
 
+    /// Observe one coalesced stack-owned egress-demand transition.
+    ///
+    /// The update carries no packet, SRAM reservation or transmit authority.
+    /// Drivers without asynchronous keyed policy may ignore it.
+    #[cfg(feature = "tx-egress-metadata")]
+    #[allow(unused_variables)]
+    fn update_egress_demand(&mut self, cx: &mut Context, update: EgressDemandUpdate) {}
+
     /// Get the device's hardware address.
     ///
     /// The returned hardware address also determines the "medium" of this driver. This indicates
@@ -358,6 +480,10 @@ impl<T: ?Sized + Driver> Driver for &mut T {
     #[cfg(feature = "tx-egress-metadata")]
     fn egress_schedule(&mut self) -> Option<EgressSchedule> {
         T::egress_schedule(self)
+    }
+    #[cfg(feature = "tx-egress-metadata")]
+    fn update_egress_demand(&mut self, cx: &mut Context, update: EgressDemandUpdate) {
+        T::update_egress_demand(self, cx, update)
     }
     fn link_state(&mut self, cx: &mut Context) -> LinkState {
         T::link_state(self, cx)
