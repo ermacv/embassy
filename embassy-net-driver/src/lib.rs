@@ -501,6 +501,17 @@ pub trait Driver {
     /// if there is no free space and fail later.
     fn transmit(&mut self, cx: &mut Context) -> Option<Self::TxToken<'_>>;
 
+    /// Construct a token for bounded network-control traffic.
+    ///
+    /// The default shares ordinary TX capacity. Drivers with authoritative
+    /// keyed scheduling may override this with a fixed reserve so DHCP, DNS
+    /// and ICMP cannot be deadlocked behind saturated bulk traffic. This path
+    /// must not be used for uncatalogued TCP or raw bulk providers.
+    #[cfg(feature = "tx-egress-metadata")]
+    fn transmit_control(&mut self, cx: &mut Context) -> Option<Self::TxToken<'_>> {
+        self.transmit(cx)
+    }
+
     /// Canonicalize a stack-resolved route into the driver scheduling domain.
     #[cfg(feature = "tx-egress-metadata")]
     fn egress_key(&mut self, route: EgressRoute) -> EgressKey {
@@ -584,6 +595,10 @@ impl<T: ?Sized + Driver> Driver for &mut T {
 
     fn transmit(&mut self, cx: &mut Context) -> Option<Self::TxToken<'_>> {
         T::transmit(self, cx)
+    }
+    #[cfg(feature = "tx-egress-metadata")]
+    fn transmit_control(&mut self, cx: &mut Context) -> Option<Self::TxToken<'_>> {
+        T::transmit_control(self, cx)
     }
     #[cfg(feature = "tx-egress-metadata")]
     fn egress_key(&mut self, route: EgressRoute) -> EgressKey {

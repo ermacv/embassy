@@ -74,6 +74,26 @@ where
     }
 
     #[cfg(feature = "tx-egress-metadata")]
+    fn transmit_control(&mut self) -> Option<Self::TxToken<'_>> {
+        if self.tx_token_limit.is_some_and(|limit| self.tx_tokens_issued >= limit) {
+            self.tx_budget_exhausted = true;
+            return None;
+        }
+        let token = self
+            .inner
+            .transmit_control(unwrap!(self.cx.as_deref_mut()))
+            .map(TxTokenAdapter);
+
+        if token.is_some() {
+            self.tx_tokens_issued = self.tx_tokens_issued.saturating_add(1);
+        } else {
+            self.tx_exhausted = true;
+        }
+
+        token
+    }
+
+    #[cfg(feature = "tx-egress-metadata")]
     fn egress_key(&mut self, route: phy::EgressRoute) -> phy::EgressKey {
         let destination = match route.destination {
             phy::EgressHardwareAddress::Ethernet(address) => HardwareAddress::Ethernet(address),
@@ -311,6 +331,8 @@ mod tests {
 
     struct TestDriver {
         transmit_calls: u32,
+        #[cfg(feature = "tx-egress-metadata")]
+        control_transmit_calls: u32,
         tx_available: bool,
         #[cfg(feature = "tx-egress-metadata")]
         keyed_result: u8,
@@ -354,6 +376,12 @@ mod tests {
 
         fn transmit(&mut self, _cx: &mut Context<'_>) -> Option<Self::TxToken<'_>> {
             self.transmit_calls += 1;
+            self.tx_available.then_some(TestTxToken)
+        }
+
+        #[cfg(feature = "tx-egress-metadata")]
+        fn transmit_control(&mut self, _cx: &mut Context<'_>) -> Option<Self::TxToken<'_>> {
+            self.control_transmit_calls += 1;
             self.tx_available.then_some(TestTxToken)
         }
 
@@ -425,6 +453,8 @@ mod tests {
         let mut cx = Context::from_waker(waker);
         let mut driver = TestDriver {
             transmit_calls: 0,
+            #[cfg(feature = "tx-egress-metadata")]
+            control_transmit_calls: 0,
             tx_available: true,
             #[cfg(feature = "tx-egress-metadata")]
             keyed_result: 0,
@@ -452,11 +482,34 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "tx-egress-metadata")]
+    fn control_admission_reaches_the_distinct_driver_reserve() {
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut driver = TestDriver {
+            transmit_calls: 0,
+            control_transmit_calls: 0,
+            tx_available: true,
+            keyed_result: 0,
+            last_egress: None,
+            schedule: None,
+            last_demand: None,
+        };
+        let mut adapter = adapter(&mut driver, &mut cx);
+
+        assert!(Device::transmit_control(&mut adapter).is_some());
+        assert_eq!(adapter.inner.control_transmit_calls, 1);
+        assert_eq!(adapter.inner.transmit_calls, 0);
+    }
+
+    #[test]
     fn hardware_tx_exhaustion_remains_distinct() {
         let waker = Waker::noop();
         let mut cx = Context::from_waker(waker);
         let mut driver = TestDriver {
             transmit_calls: 0,
+            #[cfg(feature = "tx-egress-metadata")]
+            control_transmit_calls: 0,
             tx_available: false,
             #[cfg(feature = "tx-egress-metadata")]
             keyed_result: 0,
@@ -483,6 +536,7 @@ mod tests {
         let mut cx = Context::from_waker(waker);
         let mut driver = TestDriver {
             transmit_calls: 0,
+            control_transmit_calls: 0,
             tx_available: true,
             keyed_result: 0,
             last_egress: None,
@@ -540,6 +594,7 @@ mod tests {
         let mut cx = Context::from_waker(waker);
         let mut driver = TestDriver {
             transmit_calls: 0,
+            control_transmit_calls: 0,
             tx_available: true,
             keyed_result: 0,
             last_egress: None,
