@@ -532,6 +532,18 @@ pub trait Driver {
         }
     }
 
+    /// Spend one packet credit from an exact driver-issued egress grant.
+    ///
+    /// The stack has already selected a queue matching the grant. An
+    /// authoritative driver must validate the serial, epoch and remaining
+    /// credit, and derive physical packet metadata from its retained grant.
+    /// The default rejects because ordinary drivers own no such authority.
+    #[cfg(feature = "tx-egress-metadata")]
+    #[allow(unused_variables)]
+    fn transmit_granted(&mut self, cx: &mut Context, grant_serial: NonZeroU32) -> EgressAdmission<Self::TxToken<'_>> {
+        EgressAdmission::KeyDeferred
+    }
+
     /// Get the link state.
     ///
     /// This function must return the current link state of the device, and wake `cx.waker()` when
@@ -608,6 +620,10 @@ impl<T: ?Sized + Driver> Driver for &mut T {
     #[cfg(feature = "tx-egress-metadata")]
     fn transmit_for(&mut self, cx: &mut Context, egress: EgressKey) -> EgressAdmission<Self::TxToken<'_>> {
         T::transmit_for(self, cx, egress)
+    }
+    #[cfg(feature = "tx-egress-metadata")]
+    fn transmit_granted(&mut self, cx: &mut Context, grant_serial: NonZeroU32) -> EgressAdmission<Self::TxToken<'_>> {
+        T::transmit_granted(self, cx, grant_serial)
     }
     fn receive(&mut self, cx: &mut Context) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         T::receive(self, cx)

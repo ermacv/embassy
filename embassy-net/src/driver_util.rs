@@ -128,6 +128,28 @@ where
         }
     }
 
+    #[cfg(feature = "tx-egress-metadata")]
+    fn transmit_granted(&mut self, grant_serial: core::num::NonZeroU32) -> phy::EgressAdmission<Self::TxToken<'_>> {
+        if self.tx_token_limit.is_some_and(|limit| self.tx_tokens_issued >= limit) {
+            self.tx_budget_exhausted = true;
+            return phy::EgressAdmission::GlobalExhausted;
+        }
+        match self
+            .inner
+            .transmit_granted(unwrap!(self.cx.as_deref_mut()), grant_serial)
+        {
+            EgressAdmission::Granted(token) => {
+                self.tx_tokens_issued = self.tx_tokens_issued.saturating_add(1);
+                phy::EgressAdmission::Granted(TxTokenAdapter(token))
+            }
+            EgressAdmission::GlobalExhausted => {
+                self.tx_exhausted = true;
+                phy::EgressAdmission::GlobalExhausted
+            }
+            EgressAdmission::KeyDeferred => phy::EgressAdmission::KeyDeferred,
+        }
+    }
+
     /// Get a description of device capabilities.
     fn capabilities(&self) -> phy::DeviceCapabilities {
         fn convert(c: Checksum) -> phy::Checksum {
@@ -633,6 +655,7 @@ mod tests {
         struct GrantDriver {
             grant: Option<embassy_net_driver::EgressBurstGrant>,
             completion: Option<embassy_net_driver::EgressGrantCompletion>,
+            admission_serial: Option<NonZeroU32>,
         }
 
         impl Driver for GrantDriver {
@@ -645,6 +668,15 @@ mod tests {
 
             fn transmit(&mut self, _cx: &mut Context<'_>) -> Option<Self::TxToken<'_>> {
                 None
+            }
+
+            fn transmit_granted(
+                &mut self,
+                _cx: &mut Context<'_>,
+                grant_serial: NonZeroU32,
+            ) -> embassy_net_driver::EgressAdmission<Self::TxToken<'_>> {
+                self.admission_serial = Some(grant_serial);
+                embassy_net_driver::EgressAdmission::Granted(TestTxToken)
             }
 
             fn poll_egress_grant(&mut self, _cx: &mut Context<'_>) -> Option<embassy_net_driver::EgressBurstGrant> {
@@ -686,6 +718,7 @@ mod tests {
         let mut driver = GrantDriver {
             grant: Some(grant),
             completion: None,
+            admission_serial: None,
         };
         let mut cx = Context::from_waker(Waker::noop());
         let mut adapter = DriverAdapter {
@@ -702,6 +735,11 @@ mod tests {
         assert_eq!(observed.serial(), grant.serial());
         assert_eq!(observed.demand().key().words(), demand.key().words());
         assert_eq!(observed.frame_credits(), grant.frame_credits());
+        assert!(matches!(
+            Device::transmit_granted(&mut adapter, observed.serial()),
+            phy::EgressAdmission::Granted(_)
+        ));
+        assert_eq!(adapter.inner.admission_serial, Some(grant.serial()));
         let remaining = phy::EgressDemandLevel::new(NonZeroU16::new(3).unwrap(), false);
         Device::finish_egress_grant(
             &mut adapter,
