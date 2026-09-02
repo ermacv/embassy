@@ -6,6 +6,10 @@ pub(crate) const DIRECTION_QUANTUM: u8 = 4;
 // owner an executor turn before ingress can fill the queue by itself.
 pub(crate) const INGRESS_LIMIT: u8 = 32;
 pub(crate) const EGRESS_LIMIT: u8 = 32;
+// A control-plane transition can require another bounded socket scan without
+// issuing a TX token. Bound those scans independently so a stream of stale or
+// terminal egress grants cannot monopolize a cooperative executor turn.
+pub(crate) const EGRESS_PASS_LIMIT: u8 = 16;
 
 pub(crate) fn take_start_direction(next_starts_with_ingress: &mut bool) -> bool {
     let starts_with_ingress = *next_starts_with_ingress;
@@ -41,7 +45,7 @@ pub struct CooperativePollReport {
     pub egress_blocked: bool,
     /// Whether ingress reached its frame budget.
     pub ingress_budget_exhausted: bool,
-    /// Whether egress reached its issued-frame budget.
+    /// Whether egress reached its issued-frame or state-transition budget.
     pub egress_budget_exhausted: bool,
     /// Whether this turn started with ingress.
     pub started_with_ingress: bool,
@@ -83,7 +87,10 @@ impl CooperativePollState {
     }
 
     pub(crate) fn can_poll_egress(&self) -> bool {
-        !self.egress_drained && !self.egress_blocked && self.egress_tx_tokens < u32::from(EGRESS_LIMIT)
+        !self.egress_drained
+            && !self.egress_blocked
+            && self.egress_tx_tokens < u32::from(EGRESS_LIMIT)
+            && self.egress_passes < EGRESS_PASS_LIMIT
     }
 
     pub(crate) fn can_poll(&self) -> bool {
@@ -110,7 +117,9 @@ impl CooperativePollState {
 
     pub(crate) fn should_self_wake(&self) -> bool {
         (!self.ingress_drained && self.ingress_packets >= INGRESS_LIMIT)
-            || (!self.egress_drained && !self.egress_blocked && self.egress_tx_tokens >= u32::from(EGRESS_LIMIT))
+            || (!self.egress_drained
+                && !self.egress_blocked
+                && (self.egress_tx_tokens >= u32::from(EGRESS_LIMIT) || self.egress_passes >= EGRESS_PASS_LIMIT))
     }
 
     /// Socket producers do not need to wake this runner while egress is
@@ -118,14 +127,17 @@ impl CooperativePollState {
     /// the already-scheduled cooperative self-wake will either continue the
     /// bounded drain or prove that the device is exhausted.
     pub(crate) fn gate_socket_egress_wake(&self) -> bool {
-        self.egress_blocked || (!self.egress_drained && self.egress_tx_tokens >= u32::from(EGRESS_LIMIT))
+        self.egress_blocked
+            || (!self.egress_drained
+                && (self.egress_tx_tokens >= u32::from(EGRESS_LIMIT) || self.egress_passes >= EGRESS_PASS_LIMIT))
     }
 
     #[cfg(feature = "cooperative-scheduler-telemetry")]
     pub(crate) fn report(&self) -> CooperativePollReport {
         let ingress_budget_exhausted = !self.ingress_drained && self.ingress_packets >= INGRESS_LIMIT;
-        let egress_budget_exhausted =
-            !self.egress_drained && !self.egress_blocked && self.egress_tx_tokens >= u32::from(EGRESS_LIMIT);
+        let egress_budget_exhausted = !self.egress_drained
+            && !self.egress_blocked
+            && (self.egress_tx_tokens >= u32::from(EGRESS_LIMIT) || self.egress_passes >= EGRESS_PASS_LIMIT);
         let exit = if ingress_budget_exhausted || egress_budget_exhausted {
             CooperativePollExit::WorkBudget
         } else if self.egress_blocked {
@@ -216,6 +228,21 @@ mod tests {
         state.record_egress(PollResult::None, u32::from(DIRECTION_QUANTUM), false, true);
         assert!(!state.egress_drained);
         assert!(state.can_poll_egress());
+    }
+
+    #[test]
+    fn state_only_egress_progress_returns_to_the_executor() {
+        let mut state = CooperativePollState::new(false);
+        state.ingress_drained = true;
+        for _ in 0..EGRESS_PASS_LIMIT {
+            state.record_egress(PollResult::SocketStateChanged, 0, false, false);
+        }
+
+        assert!(!state.can_poll_egress());
+        assert!(state.should_self_wake());
+        assert!(state.gate_socket_egress_wake());
+        assert_eq!(state.report().exit, CooperativePollExit::WorkBudget);
+        assert!(state.report().egress_budget_exhausted);
     }
 
     #[test]
