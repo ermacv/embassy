@@ -3,8 +3,8 @@ use core::task::Context;
 use embassy_net_driver::{Capabilities, Checksum, Driver, PacketMeta, RxToken, TxToken};
 #[cfg(feature = "tx-egress-metadata")]
 use embassy_net_driver::{
-    EgressAdmission, EgressDemand, EgressDemandId, EgressDemandLevel, EgressDemandUpdate, EgressKey, EgressRoute,
-    HardwareAddress,
+    EgressAdmission, EgressDemand, EgressDemandId, EgressDemandLevel, EgressDemandUpdate, EgressGrantCompletion,
+    EgressGrantMode, EgressKey, EgressRoute, HardwareAddress,
 };
 use xarxa::phy::{self, Medium};
 
@@ -145,6 +145,11 @@ where
                 schedule.max_packets_per_key(),
                 schedule.dispatch_quantum(),
                 schedule.epoch(),
+                match schedule.grant_mode() {
+                    EgressGrantMode::StackSelected => phy::EgressGrantMode::StackSelected,
+                    EgressGrantMode::Shadow => phy::EgressGrantMode::Shadow,
+                    EgressGrantMode::Authoritative => phy::EgressGrantMode::Authoritative,
+                },
             )
         })
     }
@@ -164,6 +169,39 @@ where
             },
         };
         self.inner.update_egress_demand(unwrap!(self.cx.as_deref_mut()), update);
+    }
+
+    #[cfg(feature = "tx-egress-metadata")]
+    fn poll_egress_grant(&mut self) -> Option<phy::EgressBurstGrant> {
+        self.inner
+            .poll_egress_grant(unwrap!(self.cx.as_deref_mut()))
+            .map(|grant| {
+                let demand = grant.demand();
+                phy::EgressBurstGrant::new(
+                    grant.serial(),
+                    phy::EgressDemand::new(
+                        phy::EgressDemandId::new(demand.id().schedule_epoch(), demand.id().activation()),
+                        phy::EgressKey::from_words(demand.key().words()),
+                        phy::EgressDemandLevel::new(demand.level().ready_units(), demand.level().horizon_ready()),
+                    ),
+                    grant.frame_credits(),
+                    grant.airtime_hundred_nanoseconds(),
+                )
+            })
+    }
+
+    #[cfg(feature = "tx-egress-metadata")]
+    fn finish_egress_grant(&mut self, completion: phy::EgressGrantCompletion) {
+        self.inner.finish_egress_grant(
+            unwrap!(self.cx.as_deref_mut()),
+            EgressGrantCompletion::new(
+                completion.serial(),
+                completion.used_frames(),
+                completion
+                    .remaining()
+                    .map(|remaining| EgressDemandLevel::new(remaining.ready_units(), remaining.horizon_ready())),
+            ),
+        );
     }
 }
 
@@ -452,6 +490,7 @@ mod tests {
                 core::num::NonZeroU8::new(32).unwrap(),
                 core::num::NonZeroU8::new(4).unwrap(),
                 7,
+                embassy_net_driver::EgressGrantMode::StackSelected,
             )),
             last_demand: None,
         };
@@ -489,6 +528,7 @@ mod tests {
         assert_eq!(schedule.max_packets_per_key().get(), 32);
         assert_eq!(schedule.dispatch_quantum().get(), 4);
         assert_eq!(schedule.epoch(), 7);
+        assert_eq!(schedule.grant_mode(), phy::EgressGrantMode::StackSelected);
     }
 
     #[test]
@@ -526,6 +566,102 @@ mod tests {
                     embassy_net_driver::EgressKey::from_words([2, 3, 5, 7]),
                     embassy_net_driver::EgressDemandLevel::new(NonZeroU16::new(13).unwrap(), true),
                 )
+            ))
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "tx-egress-metadata")]
+    fn grant_and_completion_cross_the_stack_adapter_losslessly() {
+        use core::num::{NonZeroU8, NonZeroU16, NonZeroU32};
+
+        struct GrantDriver {
+            grant: Option<embassy_net_driver::EgressBurstGrant>,
+            completion: Option<embassy_net_driver::EgressGrantCompletion>,
+        }
+
+        impl Driver for GrantDriver {
+            type RxToken<'a> = TestRxToken;
+            type TxToken<'a> = TestTxToken;
+
+            fn receive(&mut self, _cx: &mut Context<'_>) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+                None
+            }
+
+            fn transmit(&mut self, _cx: &mut Context<'_>) -> Option<Self::TxToken<'_>> {
+                None
+            }
+
+            fn poll_egress_grant(&mut self, _cx: &mut Context<'_>) -> Option<embassy_net_driver::EgressBurstGrant> {
+                self.grant.take()
+            }
+
+            fn finish_egress_grant(
+                &mut self,
+                _cx: &mut Context<'_>,
+                completion: embassy_net_driver::EgressGrantCompletion,
+            ) {
+                self.completion = Some(completion);
+            }
+
+            fn link_state(&mut self, _cx: &mut Context<'_>) -> LinkState {
+                LinkState::Up
+            }
+
+            fn capabilities(&self) -> Capabilities {
+                Capabilities::default()
+            }
+
+            fn hardware_address(&self) -> HardwareAddress {
+                HardwareAddress::Ethernet([0; 6])
+            }
+        }
+
+        let demand = embassy_net_driver::EgressDemand::new(
+            embassy_net_driver::EgressDemandId::new(9, NonZeroU32::new(4).unwrap()),
+            embassy_net_driver::EgressKey::from_words([2, 3, 5, 7]),
+            embassy_net_driver::EgressDemandLevel::new(NonZeroU16::new(32).unwrap(), true),
+        );
+        let grant = embassy_net_driver::EgressBurstGrant::new(
+            NonZeroU32::new(17).unwrap(),
+            demand,
+            NonZeroU8::new(32).unwrap(),
+            NonZeroU32::new(21_000).unwrap(),
+        );
+        let mut driver = GrantDriver {
+            grant: Some(grant),
+            completion: None,
+        };
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut adapter = DriverAdapter {
+            cx: Some(&mut cx),
+            inner: &mut driver,
+            medium: Medium::Ethernet,
+            tx_exhausted: false,
+            tx_tokens_issued: 0,
+            tx_token_limit: None,
+            tx_budget_exhausted: false,
+        };
+
+        let observed = Device::poll_egress_grant(&mut adapter).unwrap();
+        assert_eq!(observed.serial(), grant.serial());
+        assert_eq!(observed.demand().key().words(), demand.key().words());
+        assert_eq!(observed.frame_credits(), grant.frame_credits());
+        let remaining = phy::EgressDemandLevel::new(NonZeroU16::new(3).unwrap(), false);
+        Device::finish_egress_grant(
+            &mut adapter,
+            phy::EgressGrantCompletion::new(observed.serial(), 29, Some(remaining)),
+        );
+
+        assert_eq!(
+            adapter.inner.completion,
+            Some(embassy_net_driver::EgressGrantCompletion::new(
+                grant.serial(),
+                29,
+                Some(embassy_net_driver::EgressDemandLevel::new(
+                    NonZeroU16::new(3).unwrap(),
+                    false,
+                )),
             ))
         );
     }

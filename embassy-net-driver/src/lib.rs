@@ -166,16 +166,36 @@ pub struct EgressSchedule {
     max_packets_per_key: NonZeroU8,
     dispatch_quantum: NonZeroU8,
     epoch: u32,
+    grant_mode: EgressGrantMode,
+}
+
+/// How a keyed network interface treats a driver-issued egress quantum.
+#[cfg(feature = "tx-egress-metadata")]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum EgressGrantMode {
+    /// Preserve stack-owned key selection and do not poll driver grants.
+    StackSelected,
+    /// Observe and report a driver grant without changing packet selection.
+    Shadow,
+    /// Emit only the exact key and prefix named by a driver grant.
+    Authoritative,
 }
 
 #[cfg(feature = "tx-egress-metadata")]
 impl EgressSchedule {
     /// Create one valid keyed scheduling configuration.
-    pub const fn new(max_packets_per_key: NonZeroU8, dispatch_quantum: NonZeroU8, epoch: u32) -> Self {
+    pub const fn new(
+        max_packets_per_key: NonZeroU8,
+        dispatch_quantum: NonZeroU8,
+        epoch: u32,
+        grant_mode: EgressGrantMode,
+    ) -> Self {
         Self {
             max_packets_per_key,
             dispatch_quantum,
             epoch,
+            grant_mode,
         }
     }
 
@@ -192,6 +212,11 @@ impl EgressSchedule {
     /// Driver-owned lifecycle epoch for this scheduling domain.
     pub const fn epoch(self) -> u32 {
         self.epoch
+    }
+
+    /// Select stack-owned, observational or authoritative grant behavior.
+    pub const fn grant_mode(self) -> EgressGrantMode {
+        self.grant_mode
     }
 }
 
@@ -307,6 +332,92 @@ pub enum EgressDemandUpdate {
         /// Opaque key retained for direct consumer lookup.
         key: EgressKey,
     },
+}
+
+/// One bounded driver-selected egress quantum.
+#[cfg(feature = "tx-egress-metadata")]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct EgressBurstGrant {
+    serial: NonZeroU32,
+    demand: EgressDemand,
+    frame_credits: NonZeroU8,
+    airtime_hundred_nanoseconds: NonZeroU32,
+}
+
+#[cfg(feature = "tx-egress-metadata")]
+impl EgressBurstGrant {
+    /// Construct one identity-bound, non-zero driver quantum.
+    pub const fn new(
+        serial: NonZeroU32,
+        demand: EgressDemand,
+        frame_credits: NonZeroU8,
+        airtime_hundred_nanoseconds: NonZeroU32,
+    ) -> Self {
+        Self {
+            serial,
+            demand,
+            frame_credits,
+            airtime_hundred_nanoseconds,
+        }
+    }
+
+    /// Monotonic driver-owner grant identity.
+    pub const fn serial(self) -> NonZeroU32 {
+        self.serial
+    }
+
+    /// Exact software-demand lifetime selected by the driver.
+    pub const fn demand(self) -> EgressDemand {
+        self.demand
+    }
+
+    /// Maximum number of final packets which may spend this quantum.
+    pub const fn frame_credits(self) -> NonZeroU8 {
+        self.frame_credits
+    }
+
+    /// Conservative complete-quantum airtime reservation in 100 ns units.
+    pub const fn airtime_hundred_nanoseconds(self) -> NonZeroU32 {
+        self.airtime_hundred_nanoseconds
+    }
+}
+
+/// Exact stack-side close record for one driver-issued quantum.
+#[cfg(feature = "tx-egress-metadata")]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct EgressGrantCompletion {
+    serial: NonZeroU32,
+    used_frames: u8,
+    remaining: Option<EgressDemandLevel>,
+}
+
+#[cfg(feature = "tx-egress-metadata")]
+impl EgressGrantCompletion {
+    /// Construct one terminal stack-side grant record.
+    pub const fn new(serial: NonZeroU32, used_frames: u8, remaining: Option<EgressDemandLevel>) -> Self {
+        Self {
+            serial,
+            used_frames,
+            remaining,
+        }
+    }
+
+    /// Exact driver-owner grant identity being closed.
+    pub const fn serial(self) -> NonZeroU32 {
+        self.serial
+    }
+
+    /// Number of final packets materialized from this grant.
+    pub const fn used_frames(self) -> u8 {
+        self.used_frames
+    }
+
+    /// Exact remaining level for the same demand, or `None` when it ended.
+    pub const fn remaining(self) -> Option<EgressDemandLevel> {
+        self.remaining
+    }
 }
 
 /// The timestamp of a transmitted packet, reported by [`Device::poll_tx_timestamp`].
@@ -436,6 +547,19 @@ pub trait Driver {
     #[allow(unused_variables)]
     fn update_egress_demand(&mut self, cx: &mut Context, update: EgressDemandUpdate) {}
 
+    /// Poll one driver-selected quantum after publishing software demand.
+    #[cfg(feature = "tx-egress-metadata")]
+    #[allow(unused_variables)]
+    fn poll_egress_grant(&mut self, cx: &mut Context) -> Option<EgressBurstGrant> {
+        None
+    }
+
+    /// Close one exact driver-issued quantum with the stack's final remaining
+    /// demand snapshot.
+    #[cfg(feature = "tx-egress-metadata")]
+    #[allow(unused_variables)]
+    fn finish_egress_grant(&mut self, cx: &mut Context, completion: EgressGrantCompletion) {}
+
     /// Get the device's hardware address.
     ///
     /// The returned hardware address also determines the "medium" of this driver. This indicates
@@ -484,6 +608,14 @@ impl<T: ?Sized + Driver> Driver for &mut T {
     #[cfg(feature = "tx-egress-metadata")]
     fn update_egress_demand(&mut self, cx: &mut Context, update: EgressDemandUpdate) {
         T::update_egress_demand(self, cx, update)
+    }
+    #[cfg(feature = "tx-egress-metadata")]
+    fn poll_egress_grant(&mut self, cx: &mut Context) -> Option<EgressBurstGrant> {
+        T::poll_egress_grant(self, cx)
+    }
+    #[cfg(feature = "tx-egress-metadata")]
+    fn finish_egress_grant(&mut self, cx: &mut Context, completion: EgressGrantCompletion) {
+        T::finish_egress_grant(self, cx, completion)
     }
     fn link_state(&mut self, cx: &mut Context) -> LinkState {
         T::link_state(self, cx)
