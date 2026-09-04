@@ -115,6 +115,8 @@ alloc = ["xarxa/alloc"]
 ## Keep enough resolved neighbors for the ESP32-S31 SoftAP client limit plus
 ## the interface's group/control destination.
 iface-neighbor-cache-count-16 = ["xarxa/iface-neighbor-cache-count-16"]
+## Keep enough opaque device-key queues for fifteen SoftAP peers plus group traffic.
+iface-egress-key-count-16 = ["xarxa/iface-egress-key-count-16"]
 ## Enable xarxa packetmeta-id feature
 packetmeta-id = [ "xarxa/packetmeta-id", "embassy-net-driver/packetmeta-id" ]
 tx-egress-metadata = [ "xarxa/tx-egress-metadata", "embassy-net-driver/tx-egress-metadata" ]
@@ -127,7 +129,7 @@ log = { version = "0.4.14", optional = true }
 
 xarxa = {
     git = "https://github.com/ermacv/xarxa.git",
-    rev = "616725874b1138bd4969a9b40eb6536ff2119445",
+    rev = "0cdbfc427a062ba533781ee31fbf75a45dcb679a",
     default-features = false,
     features = [
         "socket",

@@ -40,3 +40,10 @@ cargo test --manifest-path ./embassy-net-adin1110/Cargo.toml
 cargo test --manifest-path ./embassy-usb-dfu/Cargo.toml --features dfu
 cargo test --manifest-path ./embassy-usb-host/Cargo.toml
 cargo test --manifest-path ./embassy-net/Cargo.toml --features tcp,dhcpv4,medium-ethernet,proto-ipv6
+# Keep the optional egress-scheduling bridge honest in both directions. The
+# feature-off check catches accidental references to optional driver types;
+# the feature-on check exercises the complete Xarxa/driver adapter schema.
+cargo check --manifest-path ./embassy-net/Cargo.toml --no-default-features --features medium-ethernet,proto-ipv4,udp
+cargo check --manifest-path ./embassy-net-driver/Cargo.toml --no-default-features
+cargo check --manifest-path ./embassy-net-driver/Cargo.toml --no-default-features --features tx-egress-metadata
+cargo check --manifest-path ./embassy-net/Cargo.toml --no-default-features --features medium-ethernet,proto-ipv4,udp,tx-egress-metadata,iface-egress-key-count-16

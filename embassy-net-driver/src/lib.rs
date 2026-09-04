@@ -165,6 +165,7 @@ impl<T> EgressAdmission<T> {
 pub struct EgressSchedule {
     max_packets_per_key: NonZeroU8,
     dispatch_quantum: NonZeroU8,
+    max_active_keys: NonZeroU16,
     epoch: u32,
     grant_mode: EgressGrantMode,
 }
@@ -188,12 +189,14 @@ impl EgressSchedule {
     pub const fn new(
         max_packets_per_key: NonZeroU8,
         dispatch_quantum: NonZeroU8,
+        max_active_keys: NonZeroU16,
         epoch: u32,
         grant_mode: EgressGrantMode,
     ) -> Self {
         Self {
             max_packets_per_key,
             dispatch_quantum,
+            max_active_keys,
             epoch,
             grant_mode,
         }
@@ -207,6 +210,11 @@ impl EgressSchedule {
     /// Maximum packets emitted from one socket during one interface pass.
     pub const fn dispatch_quantum(self) -> NonZeroU8 {
         self.dispatch_quantum
+    }
+
+    /// Maximum number of distinct keys the driver can produce in this epoch.
+    pub const fn max_active_keys(self) -> NonZeroU16 {
+        self.max_active_keys
     }
 
     /// Driver-owned lifecycle epoch for this scheduling domain.

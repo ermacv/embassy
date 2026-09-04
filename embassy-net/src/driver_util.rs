@@ -99,7 +99,7 @@ where
             phy::EgressHardwareAddress::Ethernet(address) => HardwareAddress::Ethernet(address),
             phy::EgressHardwareAddress::Ieee802154(address) => HardwareAddress::Ieee802154(address),
             phy::EgressHardwareAddress::Ip => HardwareAddress::Ip,
-            _ => return phy::EgressKey::from_route(route),
+            _ => panic!("unsupported Xarxa egress hardware-address variant"),
         };
         let key = self.inner.egress_key(EgressRoute {
             destination,
@@ -181,11 +181,13 @@ where
         smolcaps
     }
 
+    #[cfg(feature = "tx-egress-metadata")]
     fn egress_schedule(&mut self) -> Option<phy::EgressSchedule> {
         self.inner.egress_schedule().map(|schedule| {
             phy::EgressSchedule::new(
                 schedule.max_packets_per_key(),
                 schedule.dispatch_quantum(),
+                schedule.max_active_keys(),
                 schedule.epoch(),
                 match schedule.grant_mode() {
                     EgressGrantMode::StackSelected => phy::EgressGrantMode::StackSelected,
@@ -565,6 +567,7 @@ mod tests {
             schedule: Some(embassy_net_driver::EgressSchedule::new(
                 core::num::NonZeroU8::new(32).unwrap(),
                 core::num::NonZeroU8::new(4).unwrap(),
+                core::num::NonZeroU16::new(16).unwrap(),
                 7,
                 embassy_net_driver::EgressGrantMode::StackSelected,
             )),
@@ -603,6 +606,7 @@ mod tests {
         let schedule = Device::egress_schedule(&mut adapter).unwrap();
         assert_eq!(schedule.max_packets_per_key().get(), 32);
         assert_eq!(schedule.dispatch_quantum().get(), 4);
+        assert_eq!(schedule.max_active_keys().get(), 16);
         assert_eq!(schedule.epoch(), 7);
         assert_eq!(schedule.grant_mode(), phy::EgressGrantMode::StackSelected);
     }

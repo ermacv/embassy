@@ -241,8 +241,11 @@ mod tests {
         assert!(!state.can_poll_egress());
         assert!(state.should_self_wake());
         assert!(state.gate_socket_egress_wake());
-        assert_eq!(state.report().exit, CooperativePollExit::WorkBudget);
-        assert!(state.report().egress_budget_exhausted);
+        #[cfg(feature = "cooperative-scheduler-telemetry")]
+        {
+            assert_eq!(state.report().exit, CooperativePollExit::WorkBudget);
+            assert!(state.report().egress_budget_exhausted);
+        }
     }
 
     #[test]
