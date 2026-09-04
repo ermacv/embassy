@@ -28,7 +28,7 @@ build = [
 
 [dependencies]
 defmt = { version = "1.0.1", optional = true }
-xarxa-driver = { git = "https://github.com/ermacv/xarxa.git", rev = "f42f16aef73572cc834a6f0298fd275def607bcc", features = ["async"] }
+xarxa-driver = { git = "https://github.com/ermacv/xarxa.git", rev = "122e97146fc0a174ef3310f4526defc37663bed4", features = ["async"] }
 
 [features]
 defmt = ["dep:defmt", "xarxa-driver/defmt"]
