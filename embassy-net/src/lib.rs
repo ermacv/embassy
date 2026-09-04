@@ -35,7 +35,7 @@ use core::task::{Context, Poll};
 pub use embassy_net_driver as driver;
 use embassy_net_driver::{Driver, LinkState};
 pub use embassy_net_driver::{
-    HardwareAddress, PacketBuf, PacketBufAllocator, PacketMeta, PacketPool, PacketPoolStorage,
+    HardwareAddress, PacketBuf, PacketBufAllocator, PacketMeta, PacketPool, PacketPoolStorage, PacketPoolWaiter,
 };
 #[cfg(feature = "packetmeta-timestamp")]
 pub use embassy_net_driver::{Timestamp, TxTimestamp};
@@ -355,6 +355,7 @@ pub(crate) struct Inner {
     pub(crate) stack: xarxa::Stack<'static>, // Lifetime type-erased.
     pub(crate) iface: IfaceHandle,
     poll_budget: PollBudget,
+    packet_pool_waiter: PacketPoolWaiter,
     /// Waker used for triggering polls.
     pub(crate) waker: WakerRegistration,
     /// Waker used for waiting for link up or config up.
@@ -386,6 +387,12 @@ fn _assert_covariant<'a, 'b: 'a>(x: Stack<'b>) -> Stack<'a> {
 /// for the rest of the program. `packet_allocator` supplies every packet the
 /// stack itself creates. Packets received from the driver keep their own pool
 /// origin, which may use a different capacity and memory placement.
+///
+/// # Panics
+///
+/// Panics if another asynchronous stack already owns the allocator's wake
+/// registration. Use a separate general packet pool for each independently
+/// polled stack.
 pub fn new<'d, D: Driver + 'd>(
     driver: D,
     config: Config,
@@ -393,6 +400,9 @@ pub fn new<'d, D: Driver + 'd>(
     random_seed: u64,
     packet_allocator: PacketBufAllocator,
 ) -> (Stack<'d>, Runner<'d>) {
+    let packet_pool_waiter = packet_allocator
+        .try_claim_waiter()
+        .expect("an async network stack requires a packet pool with no other waiter");
     let adapter: &'d mut DriverAdapter<D> = resources.adapter.write(DriverAdapter { inner: driver });
 
     // `Inner` has no lifetime parameters, so the references it keeps are
@@ -412,6 +422,7 @@ pub fn new<'d, D: Driver + 'd>(
         stack,
         iface,
         poll_budget: DEFAULT_POLL_BUDGET,
+        packet_pool_waiter,
         waker: WakerRegistration::new(),
         state_waker: WakerRegistration::new(),
         link_up: false,
@@ -995,6 +1006,10 @@ impl Inner {
             self.config_changed();
         }
 
+        if self.stack.take_packet_allocator_starved() {
+            self.packet_pool_waiter.register(cx.waker());
+        }
+
         if outcome.budget_exhausted() || deadline <= now {
             cx.waker().wake_by_ref();
         } else if deadline != xarxa::time::Instant::MAX {
@@ -1027,5 +1042,89 @@ impl<'d> Runner<'d> {
         })
         .await;
         unreachable!()
+    }
+}
+
+#[cfg(all(test, feature = "medium-ethernet", feature = "proto-ipv4", feature = "udp"))]
+mod tests {
+    extern crate std;
+
+    use core::task::{Context, Waker};
+    use std::boxed::Box;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Wake;
+
+    use super::*;
+
+    struct TestDriver;
+
+    impl Driver for TestDriver {
+        fn capabilities(&self) -> driver::Capabilities {
+            driver::Capabilities::default()
+        }
+
+        fn hardware_address(&self) -> HardwareAddress {
+            HardwareAddress::Ethernet([0x02, 0, 0, 0, 0, 1])
+        }
+
+        fn register_waker(&mut self, _waker: &Waker) {}
+
+        fn receive(&mut self) -> Option<PacketBuf> {
+            None
+        }
+
+        fn can_transmit(&mut self) -> bool {
+            true
+        }
+
+        fn transmit(&mut self, _buf: PacketBuf) -> Result<(), PacketBuf> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct WakeCount(AtomicUsize);
+
+    impl Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn runner_wakes_when_a_starved_packet_pool_recovers() {
+        let storage = Box::leak(Box::new(PacketPoolStorage::<1>::new()));
+        let pool = Box::leak(Box::new(PacketPool::new(storage)));
+        let allocator = pool.allocator();
+        let held = allocator.try_alloc().expect("the only packet slot must allocate");
+        let resources = Box::leak(Box::new(StackResources::<TestDriver>::new()));
+        let config = Config::ipv4_static(StaticConfigV4 {
+            address: Ipv4Cidr::new(Ipv4Address::new(192, 0, 2, 1), 24),
+            gateway: None,
+            dns_servers: Vec::new(),
+        });
+        let (stack, runner) = new(TestDriver, config, resources, 1, allocator);
+        let mut socket = udp::UdpSocket::new(stack);
+        socket.bind(1234).unwrap();
+
+        assert_eq!(
+            socket.try_send_to(&[1, 2, 3], (Ipv4Address::new(192, 0, 2, 2), 4321)),
+            Err(TryError::WouldBlock)
+        );
+
+        let wake_count = Arc::new(WakeCount::default());
+        let waker = Waker::from(wake_count.clone());
+        let mut cx = Context::from_waker(&waker);
+        runner.stack.with(|inner| inner.poll(&mut cx));
+        let before_release = wake_count.0.load(Ordering::Relaxed);
+
+        drop(held);
+
+        assert!(wake_count.0.load(Ordering::Relaxed) > before_release);
     }
 }

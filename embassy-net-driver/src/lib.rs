@@ -7,7 +7,7 @@ use core::task::Waker;
 pub use xarxa_driver::config::{PACKET_BUF_ALIGN, PACKET_BUF_SIZE};
 pub use xarxa_driver::{
     Capabilities, Checksum, ChecksumCapabilities, HardwareAddress, LinkState, Medium, PacketBuf, PacketBufAllocator,
-    PacketMeta, PacketPool, PacketPoolStorage,
+    PacketMeta, PacketPool, PacketPoolStorage, PacketPoolWaiter,
 };
 #[cfg(feature = "packetmeta-timestamp")]
 pub use xarxa_driver::{Timestamp, TxTimestamp};
