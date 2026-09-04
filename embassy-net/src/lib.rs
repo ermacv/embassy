@@ -51,6 +51,7 @@ use heapless::Vec;
 /// Re-exported for access to the wire types and to the parts of the API that
 /// `embassy-net` does not wrap.
 pub use xarxa;
+pub use xarxa::PollBudget;
 #[cfg(feature = "dns")]
 pub use xarxa::config::DNS_MAX_SERVER_COUNT;
 #[cfg(feature = "multicast")]
@@ -282,6 +283,10 @@ pub struct Runner<'d> {
     stack: Stack<'d>,
 }
 
+// A moderate default for embedded executors. This is a cooperative scheduling
+// quantum, not a link-layer aggregation size or a device queue limit.
+const DEFAULT_POLL_BUDGET: PollBudget = PollBudget::new(32, 32);
+
 /// Network stack handle
 ///
 /// Use this to create sockets. It's `Copy`, so you can pass
@@ -349,6 +354,7 @@ impl<D: Driver> xarxa::driver::Driver for DriverAdapter<D> {
 pub(crate) struct Inner {
     pub(crate) stack: xarxa::Stack<'static>, // Lifetime type-erased.
     pub(crate) iface: IfaceHandle,
+    poll_budget: PollBudget,
     /// Waker used for triggering polls.
     pub(crate) waker: WakerRegistration,
     /// Waker used for waiting for link up or config up.
@@ -405,6 +411,7 @@ pub fn new<'d, D: Driver + 'd>(
     let mut inner = Inner {
         stack,
         iface,
+        poll_budget: DEFAULT_POLL_BUDGET,
         waker: WakerRegistration::new(),
         state_waker: WakerRegistration::new(),
         link_up: false,
@@ -975,8 +982,9 @@ impl Inner {
         }
 
         let now = instant_to_xarxa(Instant::now());
+        let outcome = self.stack.poll_bounded(now, self.poll_budget);
         #[allow(unused_mut)]
-        let mut deadline = self.stack.poll(now);
+        let mut deadline = outcome.deadline();
 
         #[cfg(feature = "dns")]
         {
@@ -987,7 +995,7 @@ impl Inner {
             self.config_changed();
         }
 
-        if deadline <= now {
+        if outcome.budget_exhausted() || deadline <= now {
             cx.waker().wake_by_ref();
         } else if deadline != xarxa::time::Instant::MAX {
             let t = pin!(Timer::at(instant_from_xarxa(deadline)));
@@ -999,6 +1007,16 @@ impl Inner {
 }
 
 impl<'d> Runner<'d> {
+    /// Set the maximum packet work performed in one executor turn.
+    ///
+    /// Xarxa applies independent ingress and socket-egress limits and rotates
+    /// busy interfaces and sockets between turns. A larger quantum amortizes
+    /// polling overhead; a smaller one reduces latency for unrelated executor
+    /// tasks. The default is 32 frames in each direction.
+    pub fn set_poll_budget(&mut self, budget: PollBudget) {
+        self.stack.with(|inner| inner.poll_budget = budget);
+    }
+
     /// Run the network stack.
     ///
     /// You must call this in a background task, to process network events.
