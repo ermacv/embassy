@@ -100,6 +100,7 @@ pub enum TryError<T> {
 /// storage is supplied separately to [`new`] as a [`PacketBufAllocator`], so
 /// applications can place it in the memory domain appropriate to the system.
 pub struct StackResources<D> {
+    stack: MaybeUninit<xarxa::Stack<'static>>,
     inner: MaybeUninit<RefCell<Inner>>,
     adapter: MaybeUninit<DriverAdapter<D>>,
     #[cfg(feature = "dhcpv4-hostname")]
@@ -116,6 +117,7 @@ impl<D> StackResources<D> {
     /// Create a new set of stack resources.
     pub const fn new() -> Self {
         Self {
+            stack: MaybeUninit::uninit(),
             inner: MaybeUninit::uninit(),
             adapter: MaybeUninit::uninit(),
             #[cfg(feature = "dhcpv4-hostname")]
@@ -352,7 +354,7 @@ impl<D: Driver> xarxa::driver::Driver for DriverAdapter<D> {
 }
 
 pub(crate) struct Inner {
-    pub(crate) stack: xarxa::Stack<'static>, // Lifetime type-erased.
+    pub(crate) stack: &'static mut xarxa::Stack<'static>, // Lifetime type-erased.
     pub(crate) iface: IfaceHandle,
     poll_budget: PollBudget,
     packet_pool_waiter: PacketPoolWaiter,
@@ -412,11 +414,19 @@ pub fn new<'d, D: Driver + 'd>(
     let adapter: &'d mut (dyn xarxa::driver::Driver + 'd) = adapter;
     let adapter: &'static mut (dyn xarxa::driver::Driver + 'static) = unsafe { core::mem::transmute(adapter) };
 
-    let mut stack = xarxa::Stack::new(random_seed, packet_allocator);
+    // Keep the array-backed protocol state in its final resource slot. Moving
+    // it through a local `Stack` and then a local `Inner` doubles the temporary
+    // storage required during network construction.
+    let stack = resources.stack.write(xarxa::Stack::new(random_seed, packet_allocator));
     let iface = unwrap!(stack.add_iface_borrowed(adapter).ok());
 
     #[cfg(feature = "dns")]
-    let dns = unwrap!(xarxa::dns::DnsClient::new(&mut stack, &[]).ok());
+    let dns = unwrap!(xarxa::dns::DnsClient::new(stack, &[]).ok());
+
+    // SAFETY: `stack` and `Inner` are distinct slots of `resources`, borrowed
+    // exclusively for `'d`. The returned Stack and Runner retain that lifetime;
+    // no reference stored in Inner can escape it, just like the adapter above.
+    let stack: &'static mut xarxa::Stack<'static> = unsafe { core::mem::transmute(stack) };
 
     let mut inner = Inner {
         stack,
@@ -999,7 +1009,7 @@ impl Inner {
 
         #[cfg(feature = "dns")]
         {
-            deadline = deadline.min(self.dns.poll(&mut self.stack));
+            deadline = deadline.min(self.dns.poll(self.stack));
         }
 
         if self.stack.iface(self.iface).config_generation() != self.config_generation {
@@ -1094,6 +1104,30 @@ mod tests {
         fn wake_by_ref(self: &Arc<Self>) {
             self.0.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    #[test]
+    fn resource_slots_keep_independent_endpoint_state() {
+        let endpoint = |address| {
+            let storage = Box::leak(Box::new(PacketPoolStorage::<1>::new()));
+            let pool = Box::leak(Box::new(PacketPool::new(storage)));
+            let resources = Box::leak(Box::new(StackResources::<TestDriver>::new()));
+            let config = Config::ipv4_static(StaticConfigV4 {
+                address: Ipv4Cidr::new(address, 24),
+                gateway: None,
+                dns_servers: Vec::new(),
+            });
+            new(TestDriver, config, resources, 1, pool.allocator())
+        };
+        let first_address = Ipv4Address::new(192, 0, 2, 1);
+        let second_address = Ipv4Address::new(192, 0, 2, 2);
+        let (first, _first_runner) = endpoint(first_address);
+        let (second, _second_runner) = endpoint(second_address);
+        assert_eq!(first.config_v4().unwrap().address.address(), first_address);
+        assert_eq!(second.config_v4().unwrap().address.address(), second_address);
+        first.set_config_v4(ConfigV4::None);
+        assert!(first.config_v4().is_none());
+        assert_eq!(second.config_v4().unwrap().address.address(), second_address);
     }
 
     #[test]
