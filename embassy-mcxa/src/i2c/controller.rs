@@ -9,24 +9,24 @@
 //! ## Features
 //!
 //! - **Blocking and Asynchronous Modes**: Supports both blocking and
-//! async APIs for flexibility in different runtime environments.
+//!   async APIs for flexibility in different runtime environments.
 //! - **DMA Support**: Enables high-performance data transfers using
-//! DMA.
+//!   DMA.
 //! - **Configurable Bus Speeds**: Supports standard (100 kHz), fast
-//! (400 kHz), and fast-plus (1 MHz) modes. Ultra-fast (3.4 MHz) mode
-//! is not yet implemented.
+//!   (400 kHz), and fast-plus (1 MHz) modes. Ultra-fast (3.4 MHz) mode
+//!   is not yet implemented.
 //! - **Error Handling**: Comprehensive error reporting, including
-//! FIFO errors, arbitration loss, and address NACK conditions.
+//!   FIFO errors, arbitration loss, and address NACK conditions.
 //! - **Embedded HAL Compatibility**: Implements traits from
-//! `embedded-hal` and `embedded-hal-async` for interoperability with
-//! other libraries.
+//!   `embedded-hal` and `embedded-hal-async` for interoperability with
+//!   other libraries.
 //!
 //! ### Error Types
 //!
 //! - `SetupError`: Errors related to hardware initialization, such as
-//! clock configuration issues.
+//!   clock configuration issues.
 //! - `IOError`: Errors during I2C operations, including FIFO errors,
-//! arbitration loss, and invalid buffer lengths.
+//!   arbitration loss, and invalid buffer lengths.
 //!
 //! ## Example
 //!
@@ -508,6 +508,20 @@ impl<'d, M: Mode> I2c<'d, M> {
         self.is_tx_fifo_empty() || self.status().is_err()
     }
 
+    /// Checks whether a STOP completed or an error prevents it from completing.
+    ///
+    /// A NACK automatically schedules a STOP, so keep waiting for the stop
+    /// detect flag instead of returning as soon as the NACK flag is visible.
+    fn is_stop_complete_or_error(&self) -> bool {
+        let msr = self.info.regs().msr().read();
+
+        if msr.sdf() == MsrSdf::IntYes {
+            return true;
+        }
+
+        !matches!(self.parse_status(&msr), Ok(()) | Err(IOError::AddressNack))
+    }
+
     /// Checks whether the RX FIFO is empty.
     fn is_rx_fifo_empty(&self) -> bool {
         self.info.regs().mfsr().read().rxcount() == 0
@@ -516,12 +530,14 @@ impl<'d, M: Mode> I2c<'d, M> {
     /// Parses the controller status producing an
     /// appropriate `Result<(), Error>` variant.
     fn parse_status(&self, msr: &Msr) -> Result<(), IOError> {
-        if msr.ndf() == Ndf::IntYes {
-            Err(IOError::AddressNack)
-        } else if msr.alf() == Alf::IntYes {
+        if msr.alf() == Alf::IntYes {
             Err(IOError::ArbitrationLoss)
         } else if msr.fef() == MsrFef::IntYes {
             Err(IOError::FifoError)
+        } else if msr.pltf() == Pltf::IntYes {
+            Err(IOError::Other)
+        } else if msr.ndf() == Ndf::IntYes {
+            Err(IOError::AddressNack)
         } else {
             Ok(())
         }
@@ -533,8 +549,6 @@ impl<'d, M: Mode> I2c<'d, M> {
     /// Will also send a STOP command if the tx_fifo is empty.
     fn status_and_act(&self) -> Result<(), IOError> {
         let msr = self.info.regs().msr().read();
-        self.info.regs().msr().write(|w| *w = msr);
-
         let status = self.parse_status(&msr);
 
         if let Err(IOError::AddressNack) = status {
@@ -547,10 +561,32 @@ impl<'d, M: Mode> I2c<'d, M> {
             // If neither of those conditions is true, we will send a
             // STOP ourselves.
             if !self.info.regs().mcfgr1().read().autostop() && self.is_tx_fifo_empty() {
-                self.remediation();
+                self.send_cmd(Cmd::STOP, 0);
             }
+
+            // Keep NDF asserted until STOP completes. Clearing NDF early can
+            // release the rejected command still held by the command engine,
+            // causing its data byte to become the address of the next packet.
+            while !self.is_stop_complete_or_error() {
+                core::hint::spin_loop();
+            }
+
+            let recovery_status = self.info.regs().msr().read();
+            let recovery_result = match self.parse_status(&recovery_status) {
+                Ok(()) | Err(IOError::AddressNack) => status,
+                error => error,
+            };
+
+            self.reset_fifos();
+
+            // Clear NDF only after STOP has completed, or after a terminal
+            // error has released the bus, and queued commands are discarded.
+            self.info.regs().msr().write(|w| *w = recovery_status);
+
+            return recovery_result;
         }
 
+        self.info.regs().msr().write(|w| *w = msr);
         status
     }
 
@@ -616,8 +652,9 @@ impl<'d, M: Mode> I2c<'d, M> {
 
         self.send_cmd(Cmd::STOP, 0);
 
-        // Wait for TxFIFO to be drained
-        while !self.is_tx_fifo_empty_or_error() {}
+        // Wait until STOP is observed on the bus. FIFO empty only means the
+        // command was accepted by the controller, not that it completed.
+        while !self.is_stop_complete_or_error() {}
 
         self.status_and_act()
     }
@@ -795,6 +832,16 @@ where
         });
     }
 
+    fn enable_stop_ints(&self) {
+        self.info.regs().mier().write(|w| {
+            w.set_sdie(true);
+            w.set_ndie(true);
+            w.set_alie(true);
+            w.set_feie(true);
+            w.set_pltie(true);
+        });
+    }
+
     /// Schedule sending a START command and await it being pulled from the FIFO.
     ///
     /// Does not indicate that the command was responded to.
@@ -830,10 +877,8 @@ where
         self.info
             .wait_cell()
             .wait_for(|| {
-                // enable interrupts
-                self.enable_tx_ints();
-                // if the command FIFO is empty, we're done sending stop
-                self.is_tx_fifo_empty_or_error()
+                self.enable_stop_ints();
+                self.is_stop_complete_or_error()
             })
             .await
             .map_err(|_| IOError::Other)?;
@@ -1186,79 +1231,98 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
             return Err(IOError::InvalidReadBufferLength);
         }
 
-        for chunk in read.chunks_mut(256) {
-            self.async_start(address, true).await?;
+        // Issue a single START for the whole read
+        self.async_start(address, true).await?;
 
-            // perform corrective action if the future is dropped or an
-            // error happens between here and the end of the read.
-            //
-            // NOTE: this *must* be set up *after* async_start. async_start
-            // already runs `status_and_act`, which on NACK performs its
-            // own remediation; if we set OnDrop earlier, the early `?`
-            // return would invoke remediation a second time and corrupt
-            // the controller state for the next transaction.
-            let on_drop = OnDrop::new(|| {
-                self.remediation();
-                self.info.regs().mder().modify(|w| w.set_rdde(false));
+        // perform corrective action if the future is dropped or an
+        // error happens between here and the end of the read.
+        //
+        // NOTE: this *must* be set up *after* async_start. async_start
+        // already runs `status_and_act`, which on NACK performs its
+        // own remediation; if we set OnDrop earlier, the early `?`
+        // return would invoke remediation a second time and corrupt
+        // the controller state for the next transaction.
+        let on_drop = OnDrop::new(|| {
+            self.remediation();
+            self.info.regs().mder().modify(|w| w.set_rdde(false));
+        });
+
+        // Drain the *entire* read with a single continuous DMA transfer
+        let peri_addr = self.info.regs().mrdr().as_ptr() as *const u8;
+        unsafe {
+            self.mode.rx_dma.disable_request();
+            self.mode.rx_dma.clear_done();
+            self.mode.rx_dma.clear_interrupt();
+            self.mode.rx_dma.set_request_source(self.mode.rx_request);
+            self.mode
+                .rx_dma
+                .setup_read_from_peripheral(peri_addr, read, false, TransferOptions::COMPLETE_INTERRUPT)?;
+            self.info.regs().mder().modify(|w| w.set_rdde(true));
+            self.mode.rx_dma.enable_request();
+        }
+
+        // A single RECEIVE command can request at most 256 bytes (its count
+        // field is 8-bit), and the command FIFO is only a few entries deep, so
+        // a large read needs many RECEIVE commands issued over the life of the
+        // transfer. Refills are driven by the LPI2C transmit-data flag (TDF) —
+        // i.e. by *command-FIFO space*
+
+        let mut to_request = read.len();
+        let result = core::future::poll_fn(|cx| {
+            // Register wakers for both completion sources before touching
+            // hardware state: DMA-complete (whole buffer received) and the
+            // shared I2C interrupt (TDF command-FIFO space, plus bus errors).
+            let _ = self.mode.rx_dma.wait_cell().poll_wait(cx);
+            let _ = self.info.wait_cell().poll_wait(cx);
+
+            // Surface a bus error (NACK, arbitration loss, FIFO error) rather
+            // than waiting forever for data that will never arrive.
+            if let Err(e) = self.status() {
+                return core::task::Poll::Ready(Err(e));
+            }
+
+            // Refill the command FIFO while it has space and commands remain.
+            while to_request > 0 && !self.is_tx_fifo_full() {
+                let n = to_request.min(256);
+                self.send_cmd(Cmd::RECEIVE, (n - 1) as u8);
+                to_request -= n;
+            }
+
+            // Re-arm interrupts every poll: the shared I2C ISR disables MIER on
+            // each fire. Always keep the error interrupts armed so a NACK wakes
+            // us
+            self.info.regs().mier().write(|w| {
+                w.set_ndie(true);
+                w.set_alie(true);
+                w.set_feie(true);
+                w.set_pltie(true);
+                w.set_tdie(to_request > 0);
             });
 
-            // send receive command
-            self.send_cmd(Cmd::RECEIVE, (chunk.len() - 1) as u8);
-
-            let peri_addr = self.info.regs().mrdr().as_ptr() as *const u8;
-
-            // _rx_dma is guaranteed to be Some
-            unsafe {
-                // Clean up channel state
-                self.mode.rx_dma.disable_request();
-                self.mode.rx_dma.clear_done();
-                self.mode.rx_dma.clear_interrupt();
-
-                // Set DMA request source from instance type (type-safe)
-                self.mode.rx_dma.set_request_source(self.mode.rx_request);
-
-                // Configure TCD for peripheral-to-memory transfer
-                self.mode.rx_dma.setup_read_from_peripheral(
-                    peri_addr,
-                    chunk,
-                    false,
-                    TransferOptions::COMPLETE_INTERRUPT,
-                )?;
-
-                // Enable I2C RX DMA request
-                self.info.regs().mder().modify(|w| w.set_rdde(true));
-
-                // Enable DMA channel request
-                self.mode.rx_dma.enable_request();
+            if self.mode.rx_dma.is_done() {
+                core::task::Poll::Ready(Ok(()))
+            } else {
+                core::task::Poll::Pending
             }
+        })
+        .await;
 
-            // Wait for completion asynchronously
-            core::future::poll_fn(|cx| {
-                let _ = self.mode.rx_dma.wait_cell().poll_wait(cx);
-                if self.mode.rx_dma.is_done() {
-                    core::task::Poll::Ready(())
-                } else {
-                    core::task::Poll::Pending
-                }
-            })
-            .await;
+        cortex_m::asm::dsb();
 
-            // Ensure DMA writes are visible to CPU
-            cortex_m::asm::dsb();
-            // Cleanup
-            self.info.regs().mder().modify(|w| w.set_rdde(false));
-            unsafe {
-                self.mode.rx_dma.disable_request();
-                self.mode.rx_dma.clear_done();
-            }
-
-            // defuse it; we'll re-arm on the next chunk if any.
-            on_drop.defuse();
+        self.info.regs().mder().modify(|w| w.set_rdde(false));
+        unsafe {
+            self.mode.rx_dma.disable_request();
+            self.mode.rx_dma.clear_done();
         }
+
+        result?;
 
         if send_stop == SendStop::Yes {
             self.async_stop().await?;
         }
+
+        // defuse it if the future is not dropped
+        on_drop.defuse();
 
         Ok(())
     }
@@ -1285,10 +1349,12 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
             return Ok(());
         }
 
-        // perform corrective action if the future is dropped
+        // Stop DMA before controller remediation so it cannot refill the
+        // command FIFO after the FIFO reset.
         let on_drop = OnDrop::new(|| {
-            self.remediation();
             self.info.regs().mder().modify(|w| w.set_tdde(false));
+            self.mode.tx_dma.stop();
+            self.remediation();
         });
 
         for chunk in write.chunks(DMA_MAX_TRANSFER_SIZE) {
@@ -1318,11 +1384,28 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
                 self.mode.tx_dma.enable_request();
             }
 
-            // Wait for completion asynchronously
-            core::future::poll_fn(|cx| {
+            // Wait for DMA completion or an I2C bus error. A data NACK can
+            // stop peripheral DMA requests before the transfer completes, so
+            // waiting only for DMA would leave this future pending forever.
+            let result = core::future::poll_fn(|cx| {
                 let _ = self.mode.tx_dma.wait_cell().poll_wait(cx);
+                let _ = self.info.wait_cell().poll_wait(cx);
+
+                if let Err(error) = self.status() {
+                    return core::task::Poll::Ready(Err(error));
+                }
+
+                // The shared I2C ISR disables MIER after every interrupt.
+                // Re-arm all bus-error sources on each poll.
+                self.info.regs().mier().write(|w| {
+                    w.set_ndie(true);
+                    w.set_alie(true);
+                    w.set_feie(true);
+                    w.set_pltie(true);
+                });
+
                 if self.mode.tx_dma.is_done() {
-                    core::task::Poll::Ready(())
+                    core::task::Poll::Ready(Ok(()))
                 } else {
                     core::task::Poll::Pending
                 }
@@ -1333,9 +1416,12 @@ impl<'d> AsyncEngine for I2c<'d, Dma<'d>> {
             cortex_m::asm::dsb();
             // Cleanup
             self.info.regs().mder().modify(|w| w.set_tdde(false));
-            unsafe {
-                self.mode.tx_dma.disable_request();
-                self.mode.tx_dma.clear_done();
+            self.mode.tx_dma.stop();
+
+            if let Err(error) = result {
+                self.remediation();
+                on_drop.defuse();
+                return Err(error);
             }
         }
 

@@ -39,17 +39,22 @@ pub struct Executor {
 }
 
 /// TODO: Taken from embassy-stm32, verify this is necessary or what we want
-#[unsafe(export_name = "__pender")]
-fn __pender(context: *mut ()) {
-    // Safety: `context` is either `usize::MAX` created by `Executor::run`, or a valid interrupt
-    // request number given to `InterruptExecutor::start`.
+struct McxaPender;
 
-    let context = context as usize;
+embassy_executor::pender_impl!(McxaPender);
 
-    // Try to make Rust optimize the branching away if we only use thread mode.
-    if context == THREAD_PENDER {
-        TASKS_PENDING.store(true, Ordering::Release);
-        cortex_m::asm::sev();
+impl embassy_executor::pender::Pender for McxaPender {
+    fn pend(context: *mut ()) {
+        // Safety: `context` is either `usize::MAX` created by `Executor::run`, or a valid interrupt
+        // request number given to `InterruptExecutor::start`.
+
+        let context = context as usize;
+
+        // Try to make Rust optimize the branching away if we only use thread mode.
+        if context == THREAD_PENDER {
+            TASKS_PENDING.store(true, Ordering::Release);
+            cortex_m::asm::sev();
+        }
     }
 }
 
@@ -104,6 +109,7 @@ impl Executor {
                 if let Some(s) = sleep {
                     break s;
                 }
+                embassy_executor::trace_idle();
                 debug_lo();
                 do_wfe();
                 debug_hi();
@@ -123,6 +129,7 @@ impl Executor {
                         continue;
                     }
 
+                    embassy_executor::trace_idle();
                     debug_lo();
                     do_wfe();
                     debug_hi();
@@ -144,6 +151,7 @@ impl Executor {
                     //
                     // We STAY in the CS for the deep sleep to ensure that we handle wake-up
                     // completely BEFORE yielding control flow back to interrupts.
+                    embassy_executor::trace_idle();
                     debug_lo();
                     let do_wfe_sleep = critical_section::with(|cs| {
                         let did_deep_sleep = crate::clocks::deep_sleep_if_possible(&cs);

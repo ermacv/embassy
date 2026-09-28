@@ -4,11 +4,26 @@
 #![doc = include_str!("../README.md")]
 #![warn(missing_docs)]
 
+//! ## Tracing
+//!
+//! The `trace` feature enables hooks which report task and executor lifecycle events, for
+//! example to measure the run time of tasks.
+#![cfg_attr(
+    feature = "trace",
+    doc = "Implement [`raw::trace::Trace`] and register it with [`trace_impl!`]. See the [`raw::trace`] module for the lifecycles."
+)]
+
 //! ## Feature flags
 #![doc = document_features::document_features!(feature_label = r#"<span class="stab portability"><code>{feature}</code></span>"#)]
 
 // This mod MUST go first, so that the others see its macros.
 pub(crate) mod fmt;
+
+// `#[macro_use]` so the platform modules can invoke the generated `pender_impl!` macro by its
+// bare name: macro-expanded `#[macro_export]` macros can't be invoked via `crate::` paths from
+// within the defining crate itself (rust-lang/rust#52234).
+#[macro_use]
+pub mod pender;
 
 pub use embassy_executor_macros::task;
 
@@ -27,8 +42,7 @@ macro_rules! check_at_most_one {
 check_at_most_one!(
     "platform-avr",
     "platform-cortex-m",
-    "platform-cortex-ar",
-    "platform-z7",
+    "platform-aarch32",
     "platform-riscv32",
     "platform-riscv64",
     "platform-std",
@@ -39,10 +53,9 @@ check_at_most_one!(
 #[cfg(feature = "_platform")]
 #[cfg_attr(feature = "platform-avr", path = "platform/avr.rs")]
 #[cfg_attr(feature = "platform-cortex-m", path = "platform/cortex_m.rs")]
-#[cfg_attr(feature = "platform-cortex-ar", path = "platform/cortex_ar.rs")]
+#[cfg_attr(feature = "platform-aarch32", path = "platform/aarch32.rs")]
 #[cfg_attr(feature = "platform-riscv32", path = "platform/riscv.rs")]
 #[cfg_attr(feature = "platform-riscv64", path = "platform/riscv.rs")]
-#[cfg_attr(feature = "platform-z7", path = "platform/z7.rs")]
 #[cfg_attr(feature = "platform-std", path = "platform/std.rs")]
 #[cfg_attr(feature = "platform-wasm", path = "platform/wasm.rs")]
 #[cfg_attr(feature = "platform-spin", path = "platform/spin.rs")]
@@ -55,6 +68,23 @@ pub use embassy_executor_macros::main_unspecified as main;
 pub use platform::*;
 
 pub mod raw;
+
+/// Signal to the tracing system that the current thread/core is about to go idle.
+///
+/// Thread-mode executor implementations must call this right before putting the
+/// current thread/core to sleep (e.g. `wfe`/`wfi`). Do NOT call it from an
+/// interrupt executor, which returns to a preempted context after polling and
+/// is therefore not idle.
+///
+/// Note in multi-core chips, or when using threads under std or an RTOS, this
+/// doesn't mean the entire system is idle, it only means the current core/thread is.
+///
+/// This is a no-op unless the `trace` feature is enabled.
+#[inline]
+pub fn trace_idle() {
+    #[cfg(feature = "trace")]
+    raw::trace::TraceImpl::idle();
+}
 
 mod spawner;
 pub use spawner::*;

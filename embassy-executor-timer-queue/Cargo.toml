@@ -1,6 +1,6 @@
 [package]
 name = "embassy-executor-timer-queue"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Timer queue item and interface between embassy-executor and timer queues"
 repository = "https://github.com/embassy-rs/embassy"
@@ -15,6 +15,7 @@ categories = [
 ]
 
 [dependencies]
+unitrait = { git = "https://github.com/embassy-rs/unitrait", rev = "bb96601b3d293fa27d1ca2891f6ea148e534e433" }
 
 [features]
 #! ### Timer Queue Item Size

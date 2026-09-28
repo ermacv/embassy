@@ -9,13 +9,18 @@ use std::task::Poll;
 use embassy_executor::raw::Executor;
 use embassy_executor::{Spawner, task};
 
-#[unsafe(export_name = "__pender")]
-fn __pender(context: *mut ()) {
-    unsafe {
-        let trace = &*(context as *const Trace);
-        trace.push("pend");
+struct TestPender;
+
+impl embassy_executor::pender::Pender for TestPender {
+    fn pend(context: *mut ()) {
+        unsafe {
+            let trace = &*(context as *const Trace);
+            trace.push("pend");
+        }
     }
 }
+
+embassy_executor::pender_impl!(TestPender);
 
 #[derive(Clone)]
 struct Trace {
@@ -331,8 +336,8 @@ fn recursive_task() {
 fn task_metadata() {
     #[task]
     async fn task1(expected_name: Option<&'static str>) {
-        use embassy_executor::Metadata;
-        assert_eq!(Metadata::for_current_task().await.name(), expected_name);
+        use embassy_executor::MetadataRef;
+        assert_eq!(MetadataRef::for_current_task().await.name(), expected_name);
     }
 
     // check no task name

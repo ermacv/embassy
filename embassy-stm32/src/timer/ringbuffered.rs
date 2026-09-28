@@ -5,8 +5,8 @@ use core::task::Waker;
 
 use super::low_level::Timer;
 use super::{Channel, GeneralInstance4Channel};
+pub use crate::dma::RingBufferError as Error;
 use crate::dma::WritableRingBuffer;
-use crate::dma::ringbuffer::Error;
 use crate::dma::word::Word;
 
 /// A PWM channel that uses a DMA ring buffer for continuous waveform generation.
@@ -91,13 +91,6 @@ impl<'d, T: GeneralInstance4Channel, W: Word + Into<T::Word>> RingBufferedPwmCha
         self.ring_buf.set_waker(waker)
     }
 
-    /// Request the DMA to reset. The configuration for this channel will not be preserved.
-    ///
-    /// This doesn't immediately stop the transfer, you have to wait until is_running returns false.
-    pub fn request_reset(&mut self) {
-        self.ring_buf.request_reset()
-    }
-
     /// Request the transfer to pause, keeping the existing configuration for this channel.
     /// To restart the transfer, call [`start`](Self::start) again.
     ///
@@ -119,7 +112,7 @@ impl<'d, T: GeneralInstance4Channel, W: Word + Into<T::Word>> RingBufferedPwmCha
     ///
     /// This is designed to be used with streaming output data such as the I2S/SAI or DAC.
     pub async fn stop(&mut self) {
-        self.ring_buf.stop().await
+        self.ring_buf.disable_circular_and_wait().await
     }
 
     /// Enable the given channel.

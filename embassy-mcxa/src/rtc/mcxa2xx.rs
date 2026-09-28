@@ -1,5 +1,6 @@
 //! RTC DateTime driver.
 use core::convert::Infallible;
+use core::future::Future;
 use core::marker::PhantomData;
 
 use embassy_embedded_hal::SetConfig;
@@ -300,9 +301,34 @@ impl<'a> Rtc<'a> {
     /// # Note
     ///
     /// The datetime is converted to Unix timestamp and written to the time seconds register.
+    /// The time counter is left running, so the time advances from the moment it is set.
     pub fn set_datetime(&self, datetime: DateTime) {
         let seconds = convert_datetime_to_seconds(&datetime);
+
+        // RM 31.3.2: "The time seconds register and time prescaler register can
+        // be written only when SR[TCE] is clear." Without this the writes below
+        // are silently discarded whenever the counter happens to be running.
+        self.stop();
+
+        // RM 31.3.2: "Always write to the prescaler register before writing to
+        // the seconds register, because the seconds register increments on the
+        // falling edge of bit 14 of the prescaler register." Zeroing the
+        // prescaler also guarantees a full second elapses before TSR first
+        // increments, instead of an arbitrary fraction left over from before.
+        self.info.regs().tpr().write(|w| w.0 = 0);
         self.info.regs().tsr().write(|w| w.0 = seconds);
+
+        // RM 31.3.2: "SR[TIF] is set on POR and software reset and is cleared by
+        // initializing the time seconds register", and the prescaler only
+        // increments while TIF and TOF are clear. The TSR write above cleared
+        // TIF, so the counter can now be enabled.
+        //
+        // Starting here is what makes timekeeping actually run: previously the
+        // only caller of start() was wait_for_alarm_unlocked(), so the counter
+        // stayed frozen at the value set here until an alarm was armed, and an
+        // alarm at "now + N" then fired N seconds after arming rather than N
+        // seconds after the time was set.
+        self.start();
     }
 
     /// Get the current date and time
@@ -447,25 +473,28 @@ impl<'a> Rtc<'a> {
         self.info.regs().ier().modify(|w| w.set_taie(false));
     }
 
-    /// Wait for an RTC alarm to trigger.
+    /// Program the RTC alarm and return a future that does not borrow the RTC.
+    ///
+    /// This allows callers that protect the RTC with a mutex to release the
+    /// mutex before waiting for the alarm interrupt.
     ///
     /// # Arguments
     ///
     /// * `alarm` - The date and time when the alarm should trigger
-    ///
-    /// This function will wait until the RTC alarm is triggered.
-    /// If no alarm is scheduled, it will wait indefinitely until one is scheduled and triggered.
-    pub async fn wait_for_alarm(&mut self, alarm: DateTime) {
-        let wait = self.info.wait_cell().subscribe().await;
-
+    pub fn wait_for_alarm_unlocked(&mut self, alarm: DateTime) -> impl Future<Output = ()> + 'static {
         self.set_alarm(alarm);
         self.start();
 
-        // REVISIT: propagate error?
-        let _ = wait.await;
+        let info = self.info;
+        async move {
+            let _ = info.wait_cell().wait_for(|| info.regs().sr().read().taf()).await;
+            info.regs().ier().modify(|w| w.set_taie(false));
+        }
+    }
 
-        // Clear the interrupt and disable the alarm after waking up
-        self.disable_interrupt(RtcInterruptEnable::RTC_ALARM_INTERRUPT_ENABLE);
+    /// Set an RTC alarm and wait for it to trigger.
+    pub async fn wait_for_alarm(&mut self, alarm: DateTime) {
+        self.wait_for_alarm_unlocked(alarm).await
     }
 }
 

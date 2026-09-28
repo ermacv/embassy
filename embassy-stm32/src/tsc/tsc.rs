@@ -405,9 +405,9 @@ impl<'d, T: Instance> Tsc<'d, T, Async> {
     /// Create a Tsc instance that can be awaited for completion
     pub fn new_async(
         peri: Peri<'d, T>,
+        _irq: impl interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'd,
         pin_groups: PinGroups<'d, T>,
         config: Config,
-        _irq: impl interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'd,
     ) -> Result<Self, GroupError> {
         Self::new_inner(peri, pin_groups, config)
     }
@@ -442,5 +442,21 @@ impl<'d, T: Instance> Tsc<'d, T, Blocking> {
     /// Wait for end of acquisition
     pub fn poll_for_acquisition(&mut self) {
         while self.get_state() == State::Busy {}
+    }
+
+    /// Enable interrupts
+    pub fn enable_interrupt(&mut self) {
+        T::regs().ier().modify(|w| {
+            w.set_eoaie(true);
+            w.set_mceie(true);
+        });
+    }
+
+    /// Disable interrupts
+    pub fn disable_interrupt(&mut self) {
+        T::regs().ier().modify(|w| {
+            w.set_eoaie(false);
+            w.set_mceie(false);
+        });
     }
 }

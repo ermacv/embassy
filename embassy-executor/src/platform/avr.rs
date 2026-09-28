@@ -14,10 +14,15 @@ mod thread {
 
     static SIGNAL_WORK_THREAD_MODE: AtomicBool = AtomicBool::new(false);
 
-    #[unsafe(export_name = "__pender")]
-    fn __pender(_context: *mut ()) {
-        SIGNAL_WORK_THREAD_MODE.store(true, Ordering::SeqCst);
+    struct AvrPender;
+
+    impl crate::pender::Pender for AvrPender {
+        fn pend(_context: *mut ()) {
+            SIGNAL_WORK_THREAD_MODE.store(true, Ordering::SeqCst);
+        }
     }
+
+    pender_impl!(AvrPender);
 
     /// avr Executor
     pub struct Executor {
@@ -60,6 +65,7 @@ mod thread {
                     avr_device::interrupt::disable();
                     if !SIGNAL_WORK_THREAD_MODE.swap(false, Ordering::SeqCst) {
                         avr_device::interrupt::enable();
+                        crate::trace_idle();
                         avr_device::asm::sleep();
                     } else {
                         avr_device::interrupt::enable();

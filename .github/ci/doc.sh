@@ -11,8 +11,10 @@ export CARGO_HOME=/ci/cache/cargo
 export CARGO_TARGET_DIR=/ci/cache/target
 export PATH=$CARGO_HOME/bin:$PATH
 
+# when bumping these you must increment the version, otherwise the new version will not be installed
+
 cargo install --git https://github.com/embassy-rs/cargo-embassy-devtool --locked --rev f8a8cce4092ef2566fbae04f088daa70c9e1fe93
-cargo install --git https://github.com/embassy-rs/docserver --locked --rev 5865eed8583205cee4d266277e4a639141362962
+cargo install --git https://github.com/embassy-rs/docserver --locked --rev d93a4a18c86d1dabdced03be7c994ee857f74ade
 
 mv rust-toolchain-nightly.toml rust-toolchain.toml
 
