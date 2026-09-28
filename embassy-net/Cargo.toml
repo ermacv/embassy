@@ -103,7 +103,7 @@ packetmeta-timestamp = [ "packetmeta-id", "xarxa/packetmeta-timestamp", "embassy
 defmt = { version = "1.0.1", optional = true }
 log = { version = "0.4.14", optional = true }
 
-xarxa = { git = "https://github.com/ermacv/xarxa.git", rev = "c0dcd505662a96de1db4e25741601b62535ea81c", default-features = false, features = ["async"] }
+xarxa = { git = "https://github.com/ermacv/xarxa.git", rev = "ea9385ecb83da195c6cfe6a66160b2b01572837b", default-features = false, features = ["async"] }
 
 embassy-net-driver = { version = "0.2.0", path = "../embassy-net-driver" }
 embassy-time = { version = "0.5.1", path = "../embassy-time" }
