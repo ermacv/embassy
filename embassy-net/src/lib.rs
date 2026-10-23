@@ -77,12 +77,12 @@ pub enum TryError<T> {
 /// slots per type, set by the `*-socket-count-N` features of `xarxa`. Packet
 /// buffers come from the [`PacketBufAllocator`] given to [`Stack::new`], so the
 /// application places them in the memory domain the system needs.
-pub struct StackStorage<'d> {
-    stack: MaybeUninit<xarxa::Stack<'d>>,
-    inner: MaybeUninit<RefCell<Inner<'d>>>,
+pub struct StackStorage<'d, D: Driver> {
+    stack: MaybeUninit<xarxa::Stack<'d, D>>,
+    inner: MaybeUninit<RefCell<Inner<'d, D>>>,
 }
 
-impl<'d> StackStorage<'d> {
+impl<'d, D: Driver> StackStorage<'d, D> {
     /// Create the storage for a stack.
     pub const fn new() -> Self {
         Self {
@@ -92,7 +92,7 @@ impl<'d> StackStorage<'d> {
     }
 }
 
-impl Default for StackStorage<'_> {
+impl<D: Driver> Default for StackStorage<'_, D> {
     fn default() -> Self {
         Self::new()
     }
@@ -118,8 +118,8 @@ pub(crate) fn wake_if_ok<T, E>(r: Result<T, E>) -> (Result<T, E>, WakeRunner) {
     (r, wake)
 }
 
-pub(crate) struct Inner<'d> {
-    pub(crate) stack: &'d mut xarxa::Stack<'d>,
+pub(crate) struct Inner<'d, D: Driver> {
+    pub(crate) stack: &'d mut xarxa::Stack<'d, D>,
     /// Packet work done in one runner turn.
     poll_budget: PollBudget,
     /// Wakes the runner when the general packet pool frees a buffer.
@@ -141,12 +141,20 @@ pub(crate) struct Inner<'d> {
 ///
 /// This is a handle to the stack created by [`Stack::new`]. It's `Copy`, so
 /// you can pass it by value instead of by reference.
-#[derive(Copy, Clone)]
-pub struct Stack<'d> {
-    pub(crate) inner: &'d core::cell::RefCell<Inner<'d>>,
+pub struct Stack<'d, D: Driver> {
+    pub(crate) inner: &'d core::cell::RefCell<Inner<'d, D>>,
 }
 
-impl<'d> Stack<'d> {
+// Not derived: a derive would require `D: Clone`, and the handle holds no `D`.
+impl<'d, D: Driver> Clone for Stack<'d, D> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<'d, D: Driver> Copy for Stack<'d, D> {}
+
+impl<'d, D: Driver> Stack<'d, D> {
     /// Create a network stack.
     ///
     /// `random_seed` seeds the stack's PRNG, which picks TCP initial sequence
@@ -166,10 +174,10 @@ impl<'d> Stack<'d> {
     /// registration. Use a separate general packet pool for each independently
     /// polled stack.
     pub fn new(
-        storage: &'d mut StackStorage<'d>,
+        storage: &'d mut StackStorage<'d, D>,
         random_seed: u64,
         packet_allocator: PacketBufAllocator,
-    ) -> (Self, Runner<'d>) {
+    ) -> (Self, Runner<'d, D>) {
         let packet_pool_waiter = unwrap!(
             packet_allocator.try_claim_waiter(),
             "an async network stack requires a packet pool with no other waiter"
@@ -211,7 +219,7 @@ impl<'d> Stack<'d> {
     }
 
     /// Borrow the stack. `f` says whether the runner must be woken afterwards.
-    pub(crate) fn with<R>(&self, f: impl FnOnce(&mut Inner<'d>) -> (R, WakeRunner)) -> R {
+    pub(crate) fn with<R>(&self, f: impl FnOnce(&mut Inner<'d, D>) -> (R, WakeRunner)) -> R {
         let mut inner = self.inner.borrow_mut();
         let (r, wake) = f(&mut inner);
         if wake == Wake {
@@ -272,7 +280,7 @@ impl<'d> Stack<'d> {
     /// - `HardwareAddrMismatch`: if the hardware address the device reports is
     ///   not of the kind its medium uses.
     #[cfg(feature = "alloc")]
-    pub fn add_iface(&self, driver: alloc::boxed::Box<dyn Driver + 'd>) -> Result<Iface<'d>, AddIfaceError> {
+    pub fn add_iface(&self, driver: alloc::boxed::Box<D>) -> Result<Iface<'d, D>, AddIfaceError> {
         let handle = self.with(|i| wake_if_ok(i.stack.add_iface(driver)))?;
         Ok(self.iface(handle))
     }
@@ -297,7 +305,7 @@ impl<'d> Stack<'d> {
     ///   device's medium.
     /// - `HardwareAddrMismatch`: if the hardware address the device reports is
     ///   not of the kind its medium uses.
-    pub fn add_iface_borrowed(&self, driver: &'d mut dyn Driver) -> Result<Iface<'d>, AddIfaceError> {
+    pub fn add_iface_borrowed(&self, driver: &'d mut D) -> Result<Iface<'d, D>, AddIfaceError> {
         let handle = self.with(|i| wake_if_ok(i.stack.add_iface_borrowed(driver)))?;
         Ok(self.iface(handle))
     }
@@ -306,7 +314,7 @@ impl<'d> Stack<'d> {
     ///
     /// # Panics
     /// Panics if the handle is stale (the interface was removed).
-    pub fn iface(&self, handle: IfaceHandle) -> Iface<'d> {
+    pub fn iface(&self, handle: IfaceHandle) -> Iface<'d, D> {
         self.with(|i| {
             // Check the handle is live, so a bad one panics here instead of somewhere
             // deeper the first time the interface is used.
@@ -325,7 +333,7 @@ impl<'d> Stack<'d> {
     }
 
     /// Iterate over the interfaces added to the stack.
-    pub fn ifaces(&self) -> impl Iterator<Item = Iface<'d>> + 'd {
+    pub fn ifaces(&self) -> impl Iterator<Item = Iface<'d, D>> + 'd {
         let stack = *self;
         let mut n = 0;
         core::iter::from_fn(move || {
@@ -384,12 +392,12 @@ impl<'d> Stack<'d> {
 
     /// Access the neighbor cache.
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-    pub fn neighbor_cache(&self) -> NeighborCache<'d> {
+    pub fn neighbor_cache(&self) -> NeighborCache<'d, D> {
         NeighborCache::new(*self)
     }
 
     /// Access the routing table.
-    pub fn routes(&self) -> Routes<'d> {
+    pub fn routes(&self) -> Routes<'d, D> {
         Routes::new(*self)
     }
 
@@ -537,15 +545,15 @@ impl<'d> Stack<'d> {
 /// Network stack runner.
 ///
 /// You must call [`Runner::run()`] in a background task for the network stack to work.
-pub struct Runner<'d> {
-    stack: Stack<'d>,
+pub struct Runner<'d, D: Driver> {
+    stack: Stack<'d, D>,
 }
 
 // A moderate default for embedded executors. This is a cooperative scheduling
 // quantum, not a link-layer aggregation size or a device queue limit.
 const DEFAULT_POLL_BUDGET: PollBudget = PollBudget::new(32, 32);
 
-impl<'d> Runner<'d> {
+impl<'d, D: Driver> Runner<'d, D> {
     /// Set the maximum packet work performed in one executor turn.
     ///
     /// Xarxa applies independent ingress and socket-egress limits and rotates
@@ -572,7 +580,7 @@ impl<'d> Runner<'d> {
     }
 }
 
-impl Inner<'_> {
+impl<D: Driver> Inner<'_, D> {
     /// The sum of every interface's configuration generation.
     ///
     /// Any interface's generation changing changes this, which is all the runner
@@ -683,10 +691,10 @@ impl Inner<'_> {
 }
 
 /// Wait until `predicate` holds, re-checking whenever `iface` changes state.
-pub(crate) fn wait_iface<'a>(
-    stack: Stack<'a>,
+pub(crate) fn wait_iface<'a, D: Driver>(
+    stack: Stack<'a, D>,
     handle: IfaceHandle,
-    mut predicate: impl FnMut(&mut xarxa::iface::Iface<'_, 'a>) -> bool + 'a,
+    mut predicate: impl FnMut(&mut xarxa::iface::Iface<'_, 'a, D>) -> bool + 'a,
 ) -> impl Future<Output = ()> + 'a {
     poll_fn(move |cx| {
         stack.with(|i| {
@@ -720,24 +728,24 @@ pub(crate) fn is_link_local(addr: &xarxa::iface::IfaceAddr) -> bool {
 
 /// Whether an interface counts as configured: it has an address that something
 /// other than IPv6 link-local autoconfiguration put there.
-pub(crate) fn is_config_up(iface: &xarxa::iface::Iface<'_, '_>) -> bool {
+pub(crate) fn is_config_up<D: Driver>(iface: &xarxa::iface::Iface<'_, '_, D>) -> bool {
     iface.ip_addrs().iter().any(|a| !is_link_local(a))
 }
 
 #[cfg(feature = "ipv4")]
 /// Check if any IPv4 address is configured.
-pub(crate) fn is_config_v4_up(iface: &xarxa::iface::Iface<'_, '_>) -> bool {
+pub(crate) fn is_config_v4_up<D: Driver>(iface: &xarxa::iface::Iface<'_, '_, D>) -> bool {
     iface.ip_addrs().iter().any(|a| a.cidr.is_ipv4())
 }
 
 #[cfg(feature = "ipv6")]
 /// Check if any non link-local IPv6 address is configured.
-pub(crate) fn is_config_v6_up(iface: &xarxa::iface::Iface<'_, '_>) -> bool {
+pub(crate) fn is_config_v6_up<D: Driver>(iface: &xarxa::iface::Iface<'_, '_, D>) -> bool {
     iface.ip_addrs().iter().any(|a| a.cidr.is_ipv6() && !is_link_local(a))
 }
 
 /// Whether an interface's link is up.
-pub(crate) fn is_link_up(iface: &mut xarxa::iface::Iface<'_, '_>) -> bool {
+pub(crate) fn is_link_up<D: Driver>(iface: &mut xarxa::iface::Iface<'_, '_, D>) -> bool {
     iface.link_state() == LinkState::Up
 }
 
@@ -800,7 +808,7 @@ mod tests {
     fn stack_with_address(
         allocator: PacketBufAllocator,
         address: Ipv4Addr,
-    ) -> (Stack<'static>, Runner<'static>, IfaceHandle) {
+    ) -> (Stack<'static, TestDriver>, Runner<'static, TestDriver>, IfaceHandle) {
         let storage = Box::leak(Box::new(StackStorage::new()));
         let (stack, runner) = Stack::new(storage, 1, allocator);
         let iface = stack.add_iface_borrowed(Box::leak(Box::new(TestDriver))).unwrap();

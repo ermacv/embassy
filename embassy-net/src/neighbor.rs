@@ -1,6 +1,7 @@
 //! Neighbor cache.
 
 use embassy_time::Instant;
+use xarxa::driver::Driver;
 use xarxa::error::NotUnicast;
 use xarxa::wire::{HardwareAddress, IpAddr};
 
@@ -73,13 +74,21 @@ pub enum NeighborState {
 /// them.
 ///
 /// Access it with [`Stack::neighbor_cache`].
-#[derive(Copy, Clone)]
-pub struct NeighborCache<'d> {
-    stack: Stack<'d>,
+pub struct NeighborCache<'d, D: Driver> {
+    stack: Stack<'d, D>,
 }
 
-impl<'d> NeighborCache<'d> {
-    pub(crate) fn new(stack: Stack<'d>) -> Self {
+// Not derived: a derive would require `D: Clone`, and the handle holds no `D`.
+impl<'d, D: Driver> Clone for NeighborCache<'d, D> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<'d, D: Driver> Copy for NeighborCache<'d, D> {}
+
+impl<'d, D: Driver> NeighborCache<'d, D> {
+    pub(crate) fn new(stack: Stack<'d, D>) -> Self {
         Self { stack }
     }
 

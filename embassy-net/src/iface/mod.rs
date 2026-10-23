@@ -89,19 +89,27 @@ impl IfaceAddr {
 ///
 /// Returned by [`Stack::add_iface_borrowed`] and [`Stack::iface`]. It's `Copy`,
 /// so you can pass it by value instead of by reference.
-#[derive(Copy, Clone)]
-pub struct Iface<'d> {
-    stack: Stack<'d>,
+pub struct Iface<'d, D: Driver> {
+    stack: Stack<'d, D>,
     handle: IfaceHandle,
 }
 
-impl<'d> Iface<'d> {
-    pub(crate) fn new(stack: Stack<'d>, handle: IfaceHandle) -> Self {
+// Not derived: a derive would require `D: Clone`, and the handle holds no `D`.
+impl<'d, D: Driver> Clone for Iface<'d, D> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<'d, D: Driver> Copy for Iface<'d, D> {}
+
+impl<'d, D: Driver> Iface<'d, D> {
+    pub(crate) fn new(stack: Stack<'d, D>, handle: IfaceHandle) -> Self {
         Self { stack, handle }
     }
 
     /// The stack this interface belongs to.
-    pub fn stack(&self) -> Stack<'d> {
+    pub fn stack(&self) -> Stack<'d, D> {
         self.stack
     }
 
@@ -111,13 +119,13 @@ impl<'d> Iface<'d> {
     }
 
     /// Borrow the interface. Whether the runner is woken afterwards is up to `f`.
-    fn with<R>(&self, f: impl FnOnce(&mut xarxa::iface::Iface<'_, 'd>) -> (R, WakeRunner)) -> R {
+    fn with<R>(&self, f: impl FnOnce(&mut xarxa::iface::Iface<'_, 'd, D>) -> (R, WakeRunner)) -> R {
         self.stack.with(|i| f(&mut i.stack.iface(self.handle)))
     }
 
     /// Borrow the interface to change its configuration, waking the runner if the
     /// configuration changed.
-    fn with_config<R>(&self, f: impl FnOnce(&mut xarxa::iface::Iface<'_, 'd>) -> R) -> R {
+    fn with_config<R>(&self, f: impl FnOnce(&mut xarxa::iface::Iface<'_, 'd, D>) -> R) -> R {
         self.with(|i| {
             let generation = i.config_generation();
             let r = f(i);

@@ -13,8 +13,8 @@
 use core::future::{Future, poll_fn};
 use core::task::{Context, Poll};
 
-use xarxa::driver::PacketBuf;
 pub use xarxa::driver::PacketMeta;
+use xarxa::driver::{Driver, PacketBuf};
 #[cfg(feature = "iface-bind")]
 pub use xarxa::iface::IfaceHandle;
 pub use xarxa::raw::RawMode;
@@ -67,12 +67,12 @@ pub enum RecvError {
 }
 
 /// An Raw socket.
-pub struct RawSocket<'d> {
-    stack: Stack<'d>,
+pub struct RawSocket<'d, D: Driver> {
+    stack: Stack<'d, D>,
     handle: RawHandle,
 }
 
-impl<'d> RawSocket<'d> {
+impl<'d, D: Driver> RawSocket<'d, D> {
     /// Create a new raw socket using the provided stack, receiving IP packets
     /// of the given version and protocol (`None` for any).
     ///
@@ -82,7 +82,11 @@ impl<'d> RawSocket<'d> {
     ///   [`RAW_SOCKET_COUNT`](crate::config::RAW_SOCKET_COUNT), set by the
     ///   `raw-socket-count-N` feature of `xarxa`.
     #[cfg(feature = "raw-ip")]
-    pub fn new(stack: Stack<'d>, ip_version: Option<IpVersion>, ip_protocol: Option<IpProtocol>) -> Result<Self, Full> {
+    pub fn new(
+        stack: Stack<'d, D>,
+        ip_version: Option<IpVersion>,
+        ip_protocol: Option<IpProtocol>,
+    ) -> Result<Self, Full> {
         let mut this = Self::new_unbound(stack)?;
         // The socket was just created, so it is unbound and cannot fail to bind.
         unwrap!(
@@ -102,7 +106,7 @@ impl<'d> RawSocket<'d> {
     ///   without the `alloc` feature, where the limit is
     ///   [`RAW_SOCKET_COUNT`](crate::config::RAW_SOCKET_COUNT), set by the
     ///   `raw-socket-count-N` feature of `xarxa`.
-    pub fn new_unbound(stack: Stack<'d>) -> Result<Self, Full> {
+    pub fn new_unbound(stack: Stack<'d, D>) -> Result<Self, Full> {
         let handle = stack.with(|i| (i.stack.add_raw_socket(), NoWake))?;
         Ok(Self { stack, handle })
     }
@@ -159,7 +163,7 @@ impl<'d> RawSocket<'d> {
         self.with(|s| (s.bound_iface(), NoWake))
     }
 
-    fn with<R>(&self, f: impl FnOnce(&mut raw::RawSocket<'_, 'd>) -> (R, WakeRunner)) -> R {
+    fn with<R>(&self, f: impl FnOnce(&mut raw::RawSocket<'_, 'd, D>) -> (R, WakeRunner)) -> R {
         self.stack.with(|i| f(&mut i.stack.raw_socket(self.handle)))
     }
 
@@ -396,7 +400,7 @@ impl<'d> RawSocket<'d> {
     fn poll_send<R>(
         &self,
         cx: &mut Context<'_>,
-        f: impl FnOnce(&mut raw::RawSocket<'_, 'd>) -> Result<R, raw::SendError>,
+        f: impl FnOnce(&mut raw::RawSocket<'_, 'd, D>) -> Result<R, raw::SendError>,
     ) -> Poll<Result<R, SendError>> {
         self.with(|s| match f(s) {
             Ok(r) => (Poll::Ready(Ok(r)), Wake),
@@ -417,7 +421,7 @@ impl<'d> RawSocket<'d> {
     /// [`poll_send`](Self::poll_send), only a packet that went out wakes the runner.
     fn try_send_inner<R>(
         &self,
-        f: impl FnOnce(&mut raw::RawSocket<'_, 'd>) -> Result<R, raw::SendError>,
+        f: impl FnOnce(&mut raw::RawSocket<'_, 'd, D>) -> Result<R, raw::SendError>,
     ) -> Result<R, TryError<SendError>> {
         self.with(|s| match f(s) {
             Ok(r) => (Ok(r), Wake),
@@ -554,7 +558,7 @@ impl<'d> RawSocket<'d> {
     }
 }
 
-impl Drop for RawSocket<'_> {
+impl<D: Driver> Drop for RawSocket<'_, D> {
     fn drop(&mut self) {
         self.stack.with(|i| {
             let freed = i.stack.raw_socket(self.handle).can_recv();
