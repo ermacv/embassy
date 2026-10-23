@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Fixes many bugs, some inherent to `smoltcp` design.
 - Driver implementations must now implement `xarxa-driver` instead of `embassy-net-driver`.
 - You can now attach multiple interfaces to the network stack.
+- `Stack`, `StackStorage`, `Runner`, `Iface` and the sockets are generic over the driver type: `Stack<'d, D: Driver>`. `add_iface` and `add_iface_borrowed` take `Box<D>` / `&mut D`, and there is no `dyn Driver` on the packet path. A stack holds one driver type; several interfaces are several values of `D`.
 - UDP and raw sockets are now zero-copy.
 - `UdpSocket::bind` now takes a local and a remote address.
 - Added TCP socket methods: `is_open`, `is_active`, `timeout`, `keep_alive`, `hop_limit`, `nagle_enabled`, `set_ack_delay`, `ack_delay`, `take_icmp_error` (feature `icmp-errors`).

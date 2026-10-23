@@ -4,6 +4,7 @@ use core::future::{Future, poll_fn};
 use core::marker::PhantomData;
 use core::mem;
 use core::task::{Context, Poll};
+use xarxa::driver::Driver;
 
 use embassy_time::Duration;
 use xarxa::error::{Full, InvalidHopLimit};
@@ -96,24 +97,24 @@ pub enum AcceptError {
 ///
 /// `'a` is the lifetime of the socket's buffers, `'d` the lifetime of the
 /// stack.
-pub struct TcpSocket<'a, 'd> {
-    io: TcpIo<'d>,
+pub struct TcpSocket<'a, 'd, D: Driver> {
+    io: TcpIo<'d, D>,
     bufs: PhantomData<&'a mut [u8]>,
 }
 
 /// The reader half of a TCP socket.
-pub struct TcpReader<'a, 'd> {
-    io: TcpIo<'d>,
+pub struct TcpReader<'a, 'd, D: Driver> {
+    io: TcpIo<'d, D>,
     bufs: PhantomData<&'a mut [u8]>,
 }
 
 /// The writer half of a TCP socket.
-pub struct TcpWriter<'a, 'd> {
-    io: TcpIo<'d>,
+pub struct TcpWriter<'a, 'd, D: Driver> {
+    io: TcpIo<'d, D>,
     bufs: PhantomData<&'a mut [u8]>,
 }
 
-impl<'a, 'd> TcpReader<'a, 'd> {
+impl<'a, 'd, D: Driver> TcpReader<'a, 'd, D> {
     /// Wait until the socket becomes readable.
     ///
     /// A socket becomes readable when there is some pending data in the receive buffer, or
@@ -240,7 +241,7 @@ impl<'a, 'd> TcpReader<'a, 'd> {
     }
 }
 
-impl<'a, 'd> TcpWriter<'a, 'd> {
+impl<'a, 'd, D: Driver> TcpWriter<'a, 'd, D> {
     /// Wait until the socket becomes writable.
     ///
     /// A socket becomes writable when the transmit buffer is not full, or when the transmit
@@ -346,14 +347,14 @@ impl<'a, 'd> TcpWriter<'a, 'd> {
     }
 }
 
-impl<'a, 'd> TcpSocket<'a, 'd> {
+impl<'a, 'd, D: Driver> TcpSocket<'a, 'd, D> {
     /// Create a new TCP socket on the given stack, with the given buffers.
     ///
     /// # Errors
     /// - `Full`: if the stack has no room for another TCP socket. Only possible
     ///   without the `alloc` feature, where the limit is set by the
     ///   `tcp-socket-count-N` feature of `xarxa`.
-    pub fn new(stack: Stack<'d>, rx_buffer: &'a mut [u8], tx_buffer: &'a mut [u8]) -> Result<Self, Full> {
+    pub fn new(stack: Stack<'d, D>, rx_buffer: &'a mut [u8], tx_buffer: &'a mut [u8]) -> Result<Self, Full> {
         let handle = stack.with(|i| {
             let rx_buffer: &'d mut [u8] = unsafe { mem::transmute(rx_buffer) };
             let tx_buffer: &'d mut [u8] = unsafe { mem::transmute(tx_buffer) };
@@ -468,7 +469,7 @@ impl<'a, 'd> TcpSocket<'a, 'd> {
     }
 
     /// Split the socket into reader and a writer halves.
-    pub fn split(&mut self) -> (TcpReader<'_, 'd>, TcpWriter<'_, 'd>) {
+    pub fn split(&mut self) -> (TcpReader<'_, 'd, D>, TcpWriter<'_, 'd, D>) {
         (
             TcpReader {
                 io: self.io,
@@ -932,7 +933,7 @@ impl<'a, 'd> TcpSocket<'a, 'd> {
     }
 }
 
-impl Drop for TcpSocket<'_, '_> {
+impl<D: Driver> Drop for TcpSocket<'_, '_, D> {
     fn drop(&mut self) {
         self.io
             .stack
@@ -941,13 +942,13 @@ impl Drop for TcpSocket<'_, '_> {
 }
 
 // `'a` (the buffers) is covariant; `'d` (the stack) is invariant.
-fn _assert_covariant<'a, 'b: 'a, 'd>(x: TcpSocket<'b, 'd>) -> TcpSocket<'a, 'd> {
+fn _assert_covariant<'a, 'b: 'a, 'd, D: Driver>(x: TcpSocket<'b, 'd, D>) -> TcpSocket<'a, 'd, D> {
     x
 }
-fn _assert_covariant_reader<'a, 'b: 'a, 'd>(x: TcpReader<'b, 'd>) -> TcpReader<'a, 'd> {
+fn _assert_covariant_reader<'a, 'b: 'a, 'd, D: Driver>(x: TcpReader<'b, 'd, D>) -> TcpReader<'a, 'd, D> {
     x
 }
-fn _assert_covariant_writer<'a, 'b: 'a, 'd>(x: TcpWriter<'b, 'd>) -> TcpWriter<'a, 'd> {
+fn _assert_covariant_writer<'a, 'b: 'a, 'd, D: Driver>(x: TcpWriter<'b, 'd, D>) -> TcpWriter<'a, 'd, D> {
     x
 }
 
@@ -967,13 +968,13 @@ fn _assert_covariant_writer<'a, 'b: 'a, 'd>(x: TcpWriter<'b, 'd>) -> TcpWriter<'
 /// until a socket accepts them. The queue depth is set by the
 /// `tcp-listener-backlog-N` feature of `xarxa`.
 #[cfg(feature = "tcp-listener")]
-pub struct TcpListener<'d> {
-    stack: Stack<'d>,
+pub struct TcpListener<'d, D: Driver> {
+    stack: Stack<'d, D>,
     handle: TcpListenerHandle,
 }
 
 #[cfg(feature = "tcp-listener")]
-impl<'d> TcpListener<'d> {
+impl<'d, D: Driver> TcpListener<'d, D> {
     /// Create a new TCP listener on the given stack.
     ///
     /// The listener starts closed. Call [`listen`](Self::listen) to start listening.
@@ -982,7 +983,7 @@ impl<'d> TcpListener<'d> {
     /// - `Full`: if the stack has no room for another listener. Only possible
     ///   without the `alloc` feature, where the limit is set by the
     ///   `tcp-listener-count-N` feature of `xarxa`.
-    pub fn new(stack: Stack<'d>) -> Result<Self, Full> {
+    pub fn new(stack: Stack<'d, D>) -> Result<Self, Full> {
         let handle = stack.with(|i| (i.stack.add_tcp_listener(), NoWake))?;
 
         Ok(Self { stack, handle })
@@ -1122,7 +1123,7 @@ impl<'d> TcpListener<'d> {
 }
 
 #[cfg(feature = "tcp-listener")]
-impl Drop for TcpListener<'_> {
+impl<D: Driver> Drop for TcpListener<'_, D> {
     fn drop(&mut self) {
         self.stack.with(|i| (i.stack.remove_tcp_listener(self.handle), NoWake));
     }
@@ -1130,14 +1131,22 @@ impl Drop for TcpListener<'_> {
 
 // =======================
 
-#[derive(Copy, Clone)]
-struct TcpIo<'d> {
-    stack: Stack<'d>,
+struct TcpIo<'d, D: Driver> {
+    stack: Stack<'d, D>,
     handle: TcpHandle,
 }
 
-impl<'d> TcpIo<'d> {
-    fn with<R>(&self, f: impl FnOnce(&mut tcp::TcpSocket<'_, 'd>) -> (R, WakeRunner)) -> R {
+// Not derived: a derive would require `D: Clone`, and the handle holds no `D`.
+impl<'d, D: Driver> Clone for TcpIo<'d, D> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<'d, D: Driver> Copy for TcpIo<'d, D> {}
+
+impl<'d, D: Driver> TcpIo<'d, D> {
+    fn with<R>(&self, f: impl FnOnce(&mut tcp::TcpSocket<'_, 'd, D>) -> (R, WakeRunner)) -> R {
         self.stack.with(|i| f(&mut i.stack.tcp_socket(self.handle)))
     }
 
@@ -1248,7 +1257,7 @@ impl<'d> TcpIo<'d> {
 
     /// Run `f` on the send buffer, waking the runner if it queued anything.
     fn send_with<R>(
-        s: &mut tcp::TcpSocket<'_, 'd>,
+        s: &mut tcp::TcpSocket<'_, 'd, D>,
         f: impl FnOnce(&mut [u8]) -> (usize, R),
     ) -> (Result<R, Error>, WakeRunner) {
         match s.send(|buf| {
@@ -1263,7 +1272,7 @@ impl<'d> TcpIo<'d> {
 
     /// Run `f` on the receive buffer, waking the runner if it took anything.
     fn recv_with<R>(
-        s: &mut tcp::TcpSocket<'_, 'd>,
+        s: &mut tcp::TcpSocket<'_, 'd, D>,
         f: impl FnOnce(&mut [u8]) -> (usize, R),
     ) -> (Result<R, Error>, WakeRunner) {
         match s.recv(|buf| {
@@ -1354,7 +1363,7 @@ impl<'d> TcpIo<'d> {
 
     /// Map the receive-half state to a peek result: `Ok(true)` if data can be
     /// peeked, `Ok(false)` if none has arrived yet, `Err(Ok(()))` on EOF.
-    fn peek_state(s: &mut tcp::TcpSocket<'_, 'd>) -> Result<bool, Result<(), Error>> {
+    fn peek_state(s: &mut tcp::TcpSocket<'_, 'd, D>) -> Result<bool, Result<(), Error>> {
         match s.peek(0).map(|_| ()) {
             Err(tcp::RecvError::Finished) => Err(Ok(())),
             Err(tcp::RecvError::InvalidState) => Err(Err(Error::ConnectionReset)),
@@ -1529,23 +1538,23 @@ mod embedded_io_impls {
         }
     }
 
-    impl embedded_io_async::ErrorType for TcpSocket<'_, '_> {
+    impl<D: Driver> embedded_io_async::ErrorType for TcpSocket<'_, '_, D> {
         type Error = Error;
     }
 
-    impl embedded_io_async::Read for TcpSocket<'_, '_> {
+    impl<D: Driver> embedded_io_async::Read for TcpSocket<'_, '_, D> {
         async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
             self.io.read(buf).await
         }
     }
 
-    impl embedded_io_async::ReadReady for TcpSocket<'_, '_> {
+    impl<D: Driver> embedded_io_async::ReadReady for TcpSocket<'_, '_, D> {
         fn read_ready(&mut self) -> Result<bool, Self::Error> {
             Ok(self.io.with(|s| (s.can_recv() || !s.may_recv(), NoWake)))
         }
     }
 
-    impl embedded_io_async::Write for TcpSocket<'_, '_> {
+    impl<D: Driver> embedded_io_async::Write for TcpSocket<'_, '_, D> {
         async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
             self.io.write(buf).await
         }
@@ -1555,33 +1564,33 @@ mod embedded_io_impls {
         }
     }
 
-    impl embedded_io_async::WriteReady for TcpSocket<'_, '_> {
+    impl<D: Driver> embedded_io_async::WriteReady for TcpSocket<'_, '_, D> {
         fn write_ready(&mut self) -> Result<bool, Self::Error> {
             Ok(self.io.with(|s| (s.can_send() || !s.may_send(), NoWake)))
         }
     }
 
-    impl embedded_io_async::ErrorType for TcpReader<'_, '_> {
+    impl<D: Driver> embedded_io_async::ErrorType for TcpReader<'_, '_, D> {
         type Error = Error;
     }
 
-    impl embedded_io_async::Read for TcpReader<'_, '_> {
+    impl<D: Driver> embedded_io_async::Read for TcpReader<'_, '_, D> {
         async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
             self.io.read(buf).await
         }
     }
 
-    impl embedded_io_async::ReadReady for TcpReader<'_, '_> {
+    impl<D: Driver> embedded_io_async::ReadReady for TcpReader<'_, '_, D> {
         fn read_ready(&mut self) -> Result<bool, Self::Error> {
             Ok(self.io.with(|s| (s.can_recv() || !s.may_recv(), NoWake)))
         }
     }
 
-    impl embedded_io_async::ErrorType for TcpWriter<'_, '_> {
+    impl<D: Driver> embedded_io_async::ErrorType for TcpWriter<'_, '_, D> {
         type Error = Error;
     }
 
-    impl embedded_io_async::Write for TcpWriter<'_, '_> {
+    impl<D: Driver> embedded_io_async::Write for TcpWriter<'_, '_, D> {
         async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
             self.io.write(buf).await
         }
@@ -1591,7 +1600,7 @@ mod embedded_io_impls {
         }
     }
 
-    impl embedded_io_async::WriteReady for TcpWriter<'_, '_> {
+    impl<D: Driver> embedded_io_async::WriteReady for TcpWriter<'_, '_, D> {
         fn write_ready(&mut self) -> Result<bool, Self::Error> {
             Ok(self.io.with(|s| (s.can_send() || !s.may_send(), NoWake)))
         }
@@ -1636,15 +1645,15 @@ pub mod client {
     /// TCP client connection pool compatible with `embedded-nal-async` traits.
     ///
     /// The pool is capable of managing up to N concurrent connections with tx and rx buffers according to TX_SZ and RX_SZ.
-    pub struct TcpClient<'d, const N: usize, const TX_SZ: usize = 1024, const RX_SZ: usize = 1024> {
-        stack: Stack<'d>,
+    pub struct TcpClient<'d, D: Driver, const N: usize, const TX_SZ: usize = 1024, const RX_SZ: usize = 1024> {
+        stack: Stack<'d, D>,
         state: &'d TcpClientState<N, TX_SZ, RX_SZ>,
         socket_timeout: Option<Duration>,
     }
 
-    impl<'d, const N: usize, const TX_SZ: usize, const RX_SZ: usize> TcpClient<'d, N, TX_SZ, RX_SZ> {
+    impl<'d, D: Driver, const N: usize, const TX_SZ: usize, const RX_SZ: usize> TcpClient<'d, D, N, TX_SZ, RX_SZ> {
         /// Create a new `TcpClient`.
-        pub fn new(stack: Stack<'d>, state: &'d TcpClientState<N, TX_SZ, RX_SZ>) -> Self {
+        pub fn new(stack: Stack<'d, D>, state: &'d TcpClientState<N, TX_SZ, RX_SZ>) -> Self {
             Self {
                 stack,
                 state,
@@ -1661,12 +1670,12 @@ pub mod client {
         }
     }
 
-    impl<'d, const N: usize, const TX_SZ: usize, const RX_SZ: usize> embedded_nal_async::TcpConnect
-        for TcpClient<'d, N, TX_SZ, RX_SZ>
+    impl<'d, D: Driver, const N: usize, const TX_SZ: usize, const RX_SZ: usize> embedded_nal_async::TcpConnect
+        for TcpClient<'d, D, N, TX_SZ, RX_SZ>
     {
         type Error = Error;
         type Connection<'m>
-            = TcpConnection<'m, 'd, N, TX_SZ, RX_SZ>
+            = TcpConnection<'m, 'd, D, N, TX_SZ, RX_SZ>
         where
             Self: 'm;
 
@@ -1697,14 +1706,16 @@ pub mod client {
     ///
     /// `'a` is the lifetime of the borrow of the [`TcpClient`] (whose pool the
     /// connection's buffers come from), `'d` the lifetime of the stack.
-    pub struct TcpConnection<'a, 'd, const N: usize, const TX_SZ: usize, const RX_SZ: usize> {
-        socket: TcpSocket<'a, 'd>,
+    pub struct TcpConnection<'a, 'd, D: Driver, const N: usize, const TX_SZ: usize, const RX_SZ: usize> {
+        socket: TcpSocket<'a, 'd, D>,
         state: &'a TcpClientState<N, TX_SZ, RX_SZ>,
         bufs: NonNull<([u8; TX_SZ], [u8; RX_SZ])>,
     }
 
-    impl<'a, 'd, const N: usize, const TX_SZ: usize, const RX_SZ: usize> TcpConnection<'a, 'd, N, TX_SZ, RX_SZ> {
-        fn new(stack: Stack<'d>, state: &'a TcpClientState<N, TX_SZ, RX_SZ>) -> Result<Self, Error> {
+    impl<'a, 'd, D: Driver, const N: usize, const TX_SZ: usize, const RX_SZ: usize>
+        TcpConnection<'a, 'd, D, N, TX_SZ, RX_SZ>
+    {
+        fn new(stack: Stack<'d, D>, state: &'a TcpClientState<N, TX_SZ, RX_SZ>) -> Result<Self, Error> {
             let mut bufs = state.pool.alloc().ok_or(Error::ConnectionReset)?;
             let socket = unsafe { TcpSocket::new(stack, &mut bufs.as_mut().1, &mut bufs.as_mut().0) };
             let socket = match socket {
@@ -1718,7 +1729,9 @@ pub mod client {
         }
     }
 
-    impl<const N: usize, const TX_SZ: usize, const RX_SZ: usize> Drop for TcpConnection<'_, '_, N, TX_SZ, RX_SZ> {
+    impl<D: Driver, const N: usize, const TX_SZ: usize, const RX_SZ: usize> Drop
+        for TcpConnection<'_, '_, D, N, TX_SZ, RX_SZ>
+    {
         fn drop(&mut self) {
             unsafe {
                 self.socket.close();
@@ -1727,22 +1740,22 @@ pub mod client {
         }
     }
 
-    impl<const N: usize, const TX_SZ: usize, const RX_SZ: usize> embedded_io_async::ErrorType
-        for TcpConnection<'_, '_, N, TX_SZ, RX_SZ>
+    impl<D: Driver, const N: usize, const TX_SZ: usize, const RX_SZ: usize> embedded_io_async::ErrorType
+        for TcpConnection<'_, '_, D, N, TX_SZ, RX_SZ>
     {
         type Error = Error;
     }
 
-    impl<const N: usize, const TX_SZ: usize, const RX_SZ: usize> embedded_io_async::Read
-        for TcpConnection<'_, '_, N, TX_SZ, RX_SZ>
+    impl<D: Driver, const N: usize, const TX_SZ: usize, const RX_SZ: usize> embedded_io_async::Read
+        for TcpConnection<'_, '_, D, N, TX_SZ, RX_SZ>
     {
         async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
             self.socket.read(buf).await
         }
     }
 
-    impl<const N: usize, const TX_SZ: usize, const RX_SZ: usize> embedded_io_async::Write
-        for TcpConnection<'_, '_, N, TX_SZ, RX_SZ>
+    impl<D: Driver, const N: usize, const TX_SZ: usize, const RX_SZ: usize> embedded_io_async::Write
+        for TcpConnection<'_, '_, D, N, TX_SZ, RX_SZ>
     {
         async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
             self.socket.write(buf).await

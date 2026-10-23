@@ -5,6 +5,8 @@
 //! not using `embedded-nal-async`.
 
 pub(crate) use xarxa::dns::{GetQueryResultError, StartQueryError};
+#[cfg(feature = "embedded-nal")]
+use xarxa::driver::Driver;
 pub use xarxa::wire::{DnsType as DnsQueryType, IpAddr};
 
 /// Errors returned by DnsClient.
@@ -41,16 +43,16 @@ impl From<StartQueryError> for Error {
 /// Prefer using [`Stack::dns_query`](crate::Stack::dns_query) directly if you're
 /// not using `embedded-nal-async`.
 #[cfg(feature = "embedded-nal")]
-pub struct DnsClient<'d> {
-    stack: crate::Stack<'d>,
+pub struct DnsClient<'d, D: Driver> {
+    stack: crate::Stack<'d, D>,
 }
 
 #[cfg(feature = "embedded-nal")]
-impl<'d> DnsClient<'d> {
+impl<'d, D: Driver> DnsClient<'d, D> {
     /// Create a new DNS socket using the provided stack.
     ///
     /// NOTE: If using DHCP, make sure it has reconfigured the stack to ensure the DNS servers are updated.
-    pub fn new(stack: crate::Stack<'d>) -> Self {
+    pub fn new(stack: crate::Stack<'d, D>) -> Self {
         Self { stack }
     }
 
@@ -65,7 +67,7 @@ impl<'d> DnsClient<'d> {
 }
 
 #[cfg(feature = "embedded-nal")]
-impl<'d> embedded_nal_async::Dns for DnsClient<'d> {
+impl<'d, D: Driver> embedded_nal_async::Dns for DnsClient<'d, D> {
     type Error = Error;
 
     async fn get_host_by_name(

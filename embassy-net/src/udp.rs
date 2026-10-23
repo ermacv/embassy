@@ -8,6 +8,7 @@
 
 use core::future::{Future, poll_fn};
 use core::task::{Context, Poll};
+use xarxa::driver::Driver;
 
 pub use xarxa::driver::PacketMeta;
 use xarxa::error::InvalidHopLimit;
@@ -70,18 +71,18 @@ pub enum RecvError {
 }
 
 /// An UDP socket.
-pub struct UdpSocket<'d> {
-    stack: Stack<'d>,
+pub struct UdpSocket<'d, D: Driver> {
+    stack: Stack<'d, D>,
     handle: UdpHandle,
 }
 
-impl<'d> UdpSocket<'d> {
+impl<'d, D: Driver> UdpSocket<'d, D> {
     /// Create a new UDP socket using the provided stack.
     ///
     /// Errors:
     /// - `Full` if the stack has no room for another UDP socket. The limit is set
     ///   by the `udp-socket-count-N` feature of `xarxa`.
-    pub fn new(stack: Stack<'d>) -> Result<Self, Full> {
+    pub fn new(stack: Stack<'d, D>) -> Result<Self, Full> {
         let handle = stack.with(|i| (i.stack.add_udp_socket(), NoWake))?;
 
         Ok(Self { stack, handle })
@@ -185,7 +186,7 @@ impl<'d> UdpSocket<'d> {
         self.with(|s| (s.bound_iface(), NoWake))
     }
 
-    fn with<R>(&self, f: impl FnOnce(&mut udp::UdpSocket<'_, 'd>) -> (R, WakeRunner)) -> R {
+    fn with<R>(&self, f: impl FnOnce(&mut udp::UdpSocket<'_, 'd, D>) -> (R, WakeRunner)) -> R {
         self.stack.with(|i| f(&mut i.stack.udp_socket(self.handle)))
     }
 
@@ -519,7 +520,7 @@ impl<'d> UdpSocket<'d> {
     fn poll_send<R>(
         &self,
         cx: &mut Context<'_>,
-        f: impl FnOnce(&mut udp::UdpSocket<'_, 'd>) -> Result<R, udp::SendError>,
+        f: impl FnOnce(&mut udp::UdpSocket<'_, 'd, D>) -> Result<R, udp::SendError>,
     ) -> Poll<Result<R, SendError>> {
         self.with(|s| match f(s) {
             Ok(r) => (Poll::Ready(Ok(r)), Wake),
@@ -539,7 +540,7 @@ impl<'d> UdpSocket<'d> {
     /// [`poll_send`](Self::poll_send), only a datagram that went out wakes the runner.
     fn try_send_inner<R>(
         &self,
-        f: impl FnOnce(&mut udp::UdpSocket<'_, 'd>) -> Result<R, udp::SendError>,
+        f: impl FnOnce(&mut udp::UdpSocket<'_, 'd, D>) -> Result<R, udp::SendError>,
     ) -> Result<R, TryError<SendError>> {
         self.with(|s| match f(s) {
             Ok(r) => (Ok(r), Wake),
@@ -768,7 +769,7 @@ impl<'d> UdpSocket<'d> {
     }
 }
 
-impl Drop for UdpSocket<'_> {
+impl<D: Driver> Drop for UdpSocket<'_, D> {
     fn drop(&mut self) {
         self.stack.with(|i| {
             let freed = i.stack.udp_socket(self.handle).can_recv();

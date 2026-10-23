@@ -13,6 +13,7 @@
 //! [`Stack::routes`]: crate::Stack::routes
 
 use embassy_time::Instant;
+use xarxa::driver::Driver;
 pub use xarxa::route::{RouteError, RouteOrigin};
 use xarxa::wire::{IpAddr, IpCidr};
 #[cfg(feature = "ipv4")]
@@ -110,13 +111,21 @@ impl Route {
 }
 
 /// A routing table, returned by [`Stack::routes`].
-#[derive(Copy, Clone)]
-pub struct Routes<'d> {
-    stack: Stack<'d>,
+pub struct Routes<'d, D: Driver> {
+    stack: Stack<'d, D>,
 }
 
-impl<'d> Routes<'d> {
-    pub(crate) fn new(stack: Stack<'d>) -> Self {
+// Not derived: a derive would require `D: Clone`, and the handle holds no `D`.
+impl<'d, D: Driver> Clone for Routes<'d, D> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<'d, D: Driver> Copy for Routes<'d, D> {}
+
+impl<'d, D: Driver> Routes<'d, D> {
+    pub(crate) fn new(stack: Stack<'d, D>) -> Self {
         Self { stack }
     }
 
