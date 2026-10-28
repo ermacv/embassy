@@ -30,3 +30,6 @@ To prepare the next merge, `git fetch upstream main` and review
   `Runner::set_poll_budget`), and yields when the budget is exhausted.
 - `StackStorage` holds the xarxa stack in its own slot, so construction
   builds the protocol state in place instead of moving it through locals.
+
+- `Stack::statistics()` passively exports Xarxa's saturating whole-stack
+  RX, native ICMPv4 echo generation and TX-refusal observations.

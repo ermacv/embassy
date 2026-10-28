@@ -42,7 +42,7 @@ use xarxa::driver::{Driver, LinkState, PacketBufAllocator, PacketPoolWaiter};
 #[cfg(feature = "hostname")]
 use xarxa::error::HostnameTooLong;
 use xarxa::iface::IfaceHandle;
-pub use xarxa::{PollBudget, config, error, wire};
+pub use xarxa::{PollBudget, Statistics, config, error, wire};
 pub use xarxa_driver as driver;
 
 use crate::iface::{AddIfaceError, Iface};
@@ -219,6 +219,11 @@ impl<'d, D: Driver> Stack<'d, D> {
     }
 
     /// Borrow the stack. `f` says whether the runner must be woken afterwards.
+    /// Snapshot the underlying stack's saturating packet counters without waking it.
+    pub fn statistics(&self) -> Statistics {
+        self.with(|i| (i.stack.statistics(), NoWake))
+    }
+
     pub(crate) fn with<R>(&self, f: impl FnOnce(&mut Inner<'d, D>) -> (R, WakeRunner)) -> R {
         let mut inner = self.inner.borrow_mut();
         let (r, wake) = f(&mut inner);
@@ -790,6 +795,22 @@ mod tests {
         fn transmit(&mut self, _buf: PacketBuf) -> Result<(), PacketBuf> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn statistics_snapshot_does_not_wake_the_runner() {
+        let storage = Box::leak(Box::new(PacketPoolStorage::<8>::new()));
+        let pool = Box::leak(Box::new(PacketPool::new(storage)));
+        let (stack, _runner, _) = stack_with_address(pool.allocator(), Ipv4Addr::new(192, 0, 2, 1));
+        let wakes = Arc::new(WakeCount::default());
+        let waker = Waker::from(wakes.clone());
+        stack.with(|i| {
+            i.waker.register(&waker);
+            ((), NoWake)
+        });
+        assert_eq!(stack.statistics(), Statistics::default());
+        assert_eq!(stack.statistics(), Statistics::default());
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 0);
     }
 
     #[derive(Default)]
