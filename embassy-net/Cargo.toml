@@ -145,8 +145,8 @@ packet-log = ["xarxa/packet-log"]
 defmt = { version = "1.0.1", optional = true }
 log = { version = "0.4.14", optional = true }
 
-xarxa = { git = "https://github.com/ermacv/xarxa.git", rev = "6f5ae91f9269ec3151d1aa61d0cfe0f3ae1b0798", default-features = false, features = ["async"] }
-xarxa-driver = { git = "https://github.com/ermacv/xarxa.git", rev = "6f5ae91f9269ec3151d1aa61d0cfe0f3ae1b0798", default-features = false, features = ["async"] }
+xarxa = { git = "https://github.com/ermacv/xarxa.git", rev = "8bc7796a1abba58f82b0b4430eeab53de20d4cda", default-features = false, features = ["async"] }
+xarxa-driver = { git = "https://github.com/ermacv/xarxa.git", rev = "8bc7796a1abba58f82b0b4430eeab53de20d4cda", default-features = false, features = ["async"] }
 embassy-time = { version = "0.5.1", path = "../embassy-time" }
 embassy-futures = { version = "0.1.2", path = "../embassy-futures" }
 embassy-sync = { version = "0.8.0", path = "../embassy-sync" }
