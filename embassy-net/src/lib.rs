@@ -218,12 +218,12 @@ impl<'d, D: Driver> Stack<'d, D> {
         (stack, Runner { stack })
     }
 
-    /// Borrow the stack. `f` says whether the runner must be woken afterwards.
     /// Snapshot the underlying stack's saturating packet counters without waking it.
     pub fn statistics(&self) -> Statistics {
         self.with(|i| (i.stack.statistics(), NoWake))
     }
 
+    /// Borrow the stack. `f` says whether the runner must be woken afterwards.
     pub(crate) fn with<R>(&self, f: impl FnOnce(&mut Inner<'d, D>) -> (R, WakeRunner)) -> R {
         let mut inner = self.inner.borrow_mut();
         let (r, wake) = f(&mut inner);
