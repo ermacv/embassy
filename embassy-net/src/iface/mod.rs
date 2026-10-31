@@ -143,6 +143,14 @@ impl<'d, D: Driver> Iface<'d, D> {
         self.with(|i| (f(i.driver_mut()), Wake))
     }
 
+    /// Drop the packets the interface holds for its own replies (EchoReply
+    /// owners waiting for device credit, queued ARP replies), returning each
+    /// to its origin. Call it when the interface stops; sockets keep their
+    /// own queues.
+    pub fn release_retained(&self) {
+        self.with(|i| (i.release_retained(), NoWake))
+    }
+
     /// The link state reported by the device.
     pub fn link_state(&self) -> LinkState {
         self.with(|i| (i.link_state(), NoWake))
