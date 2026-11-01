@@ -223,6 +223,19 @@ impl<'d, D: Driver> Stack<'d, D> {
         self.with(|i| (i.stack.statistics(), NoWake))
     }
 
+    /// Close every socket that queues received packets, UDP and raw, and drop
+    /// what each queued, returning every packet to its origin. Call it when the
+    /// stack stops: a driver that lent a received frame's storage gets it back.
+    /// A closed socket's waiters wake and find it closed; TCP sockets copy what
+    /// they receive and are left as they are.
+    pub fn close_packet_sockets(&self) {
+        self.with(|i| {
+            close_udp_sockets(i.stack);
+            close_raw_sockets(i.stack);
+            ((), NoWake)
+        })
+    }
+
     /// Borrow the stack. `f` says whether the runner must be woken afterwards.
     pub(crate) fn with<R>(&self, f: impl FnOnce(&mut Inner<'d, D>) -> (R, WakeRunner)) -> R {
         let mut inner = self.inner.borrow_mut();
@@ -546,6 +559,28 @@ impl<'d, D: Driver> Stack<'d, D> {
         })
     }
 }
+
+#[cfg(feature = "udp")]
+fn close_udp_sockets<D: Driver>(stack: &mut xarxa::Stack<'_, D>) {
+    let mut sockets = stack.udp_sockets();
+    while let Some((_, mut socket)) = sockets.next() {
+        socket.close();
+    }
+}
+
+#[cfg(not(feature = "udp"))]
+fn close_udp_sockets<D: Driver>(_: &mut xarxa::Stack<'_, D>) {}
+
+#[cfg(feature = "_raw")]
+fn close_raw_sockets<D: Driver>(stack: &mut xarxa::Stack<'_, D>) {
+    let mut sockets = stack.raw_sockets();
+    while let Some((_, mut socket)) = sockets.next() {
+        socket.close();
+    }
+}
+
+#[cfg(not(feature = "_raw"))]
+fn close_raw_sockets<D: Driver>(_: &mut xarxa::Stack<'_, D>) {}
 
 /// Network stack runner.
 ///
@@ -879,6 +914,104 @@ mod tests {
             "a freed buffer wakes the sender"
         );
         assert!(send.as_mut().poll(&mut Context::from_waker(&sender_waker)).is_ready());
+    }
+
+    /// A driver that receives one frame once.
+    struct OneFrame(Option<PacketBuf>);
+
+    impl Driver for OneFrame {
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+
+        fn hardware_address(&self) -> HardwareAddress {
+            HardwareAddress::Ethernet([0x02, 0, 0, 0, 0, 1])
+        }
+
+        fn register_waker(&mut self, _waker: &Waker) -> Result<(), NotSupported> {
+            Ok(())
+        }
+
+        fn receive(&mut self) -> Option<PacketBuf> {
+            self.0.take()
+        }
+
+        fn can_transmit(&mut self) -> bool {
+            true
+        }
+
+        fn transmit(&mut self, _buf: PacketBuf) -> Result<(), PacketBuf> {
+            Ok(())
+        }
+    }
+
+    /// An Ethernet frame of one UDP datagram from `source` to `destination`.
+    fn datagram(
+        mut buf: PacketBuf,
+        source: (Ipv4Addr, u16),
+        destination: (Ipv4Addr, u16),
+        payload: &[u8],
+    ) -> PacketBuf {
+        use xarxa::wire::{
+            ETHERNET_HEADER_LEN, EthernetAddress, EthernetFrame, EthernetProtocol, IPV4_HEADER_LEN, IpProtocol,
+            Ipv4Packet, UDP_HEADER_LEN, UdpPacket,
+        };
+        let ((from, from_port), (to, to_port)) = (source, destination);
+        let udp_len = UDP_HEADER_LEN + payload.len();
+        buf.set_len(ETHERNET_HEADER_LEN + IPV4_HEADER_LEN + udp_len);
+        let mut frame = EthernetFrame::new_unchecked(&mut buf[..]);
+        frame.set_dst_addr(EthernetAddress([0x02, 0, 0, 0, 0, 1]));
+        frame.set_src_addr(EthernetAddress([0x02, 0, 0, 0, 0, 2]));
+        frame.set_ethertype(EthernetProtocol::Ipv4);
+        let mut ip = Ipv4Packet::new_unchecked(frame.payload_mut());
+        ip.set_version(4);
+        ip.set_header_len(IPV4_HEADER_LEN as u8);
+        ip.set_total_len((IPV4_HEADER_LEN + udp_len) as u16);
+        ip.set_hop_limit(64);
+        ip.set_next_header(IpProtocol::Udp);
+        ip.set_src_addr(from);
+        ip.set_dst_addr(to);
+        ip.fill_checksum();
+        let mut udp = UdpPacket::new_unchecked(ip.payload_mut());
+        udp.set_src_port(from_port);
+        udp.set_dst_port(to_port);
+        udp.set_len(udp_len as u16);
+        udp.payload_mut().copy_from_slice(payload);
+        udp.fill_checksum(&from.into(), &to.into());
+        buf
+    }
+
+    #[test]
+    fn closing_the_packet_sockets_returns_a_queued_datagram_to_its_pool() {
+        let storage = Box::leak(Box::new(PacketPoolStorage::<1>::new()));
+        let pool = Box::leak(Box::new(PacketPool::new(storage)));
+        let allocator = pool.allocator();
+        let local = (Ipv4Addr::new(192, 0, 2, 1), 1234);
+        let remote = (Ipv4Addr::new(192, 0, 2, 2), 4321);
+        let only = allocator.try_alloc().expect("the only packet slot must allocate");
+        let frame = datagram(only, remote, local, &[1, 2, 3]);
+        let stack_storage = Box::leak(Box::new(StackStorage::new()));
+        let (stack, runner) = Stack::new(stack_storage, 1, allocator);
+        let iface = stack
+            .add_iface_borrowed(Box::leak(Box::new(OneFrame(Some(frame)))))
+            .unwrap();
+        iface.add_ip_addr(IpCidr::new(local.0.into(), 24)).unwrap();
+        let mut socket = udp::UdpSocket::new(stack).unwrap();
+        socket.bind(local.1, ListenSocketAddr::UNSPECIFIED).unwrap();
+
+        let waker = Waker::from(Arc::new(WakeCount::default()));
+        runner
+            .stack
+            .with(|i| (i.poll(&mut Context::from_waker(&waker)), NoWake));
+        assert!(socket.can_recv(), "the socket queued the datagram");
+        assert!(
+            allocator.try_alloc().is_none(),
+            "the queued datagram holds the only slot"
+        );
+
+        stack.close_packet_sockets();
+        assert!(allocator.try_alloc().is_some(), "the close returned the slot");
+        assert!(!socket.is_open());
     }
 
     #[test]
