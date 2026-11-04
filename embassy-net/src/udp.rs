@@ -643,7 +643,7 @@ impl<'d, D: Driver> UdpSocket<'d, D> {
     ///   address is not assigned to any interface.
     /// - `BufferFull`: if the payload cannot fit in a packet buffer.
     pub async fn send_to_with<R>(
-        &mut self,
+        &self,
         max_size: usize,
         remote: impl Into<UdpMetadata> + Copy,
         f: impl FnOnce(&mut [u8]) -> (usize, R),
@@ -692,7 +692,7 @@ impl<'d, D: Driver> UdpSocket<'d, D> {
     ///   address is not assigned to any interface.
     /// - `Other(BufferFull)`: if the payload cannot fit in a packet buffer.
     pub fn try_send_to_with<R>(
-        &mut self,
+        &self,
         size: usize,
         remote: impl Into<UdpMetadata>,
         f: impl FnOnce(&mut [u8]) -> R,
