@@ -1005,12 +1005,17 @@ where
         N - self.len()
     }
 
-    /// Clears the elements the channel holds when this is called.
+    /// Clears the elements the channel holds when this is called. One sent
+    /// meanwhile, by a dropped message or anyone else, stays.
     pub fn clear(&self) {
-        // Each message drops outside the state: its drop is foreign code.
-        for _ in 0..self.len() {
-            drop(self.try_receive());
-        }
+        // The whole portion leaves the state in one visit, before any drop:
+        // a drop is foreign code, and what it sends is no part of the portion.
+        let (messages, woken): ([Option<T>; N], _) = self.inner.lock(|s| {
+            let woken = s.senders_to_wake();
+            (core::array::from_fn(|_| s.pop()), woken)
+        });
+        wake(woken);
+        drop(messages);
     }
 
     /// Returns the number of elements currently in the channel.
@@ -1402,9 +1407,27 @@ mod tests {
                     .is_pending()
             );
             channel.clear();
-            assert_eq!(*seen.borrow(), Some(1), "the drop saw the queue without its message");
+            assert_eq!(*seen.borrow(), Some(0), "the portion left in one visit");
             assert!(channel.is_empty());
             assert_eq!(sender_wakes.load(Ordering::SeqCst), 1, "room reaches the sender");
+        }
+
+        #[test]
+        fn clear_leaves_what_a_dropped_message_sent() {
+            let channel = channel::<OnDrop, 3>();
+            let seen = Rc::new(RefCell::new(None));
+            let told = seen.clone();
+            let first = OnDrop(Some(Box::new(move || {
+                // Its neighbour already left with it; a new message stays.
+                *told.borrow_mut() = Some(channel.len());
+                drop(channel.try_receive());
+                assert!(channel.try_send(OnDrop(None)).is_ok());
+            })));
+            assert!(channel.try_send(first).is_ok());
+            assert!(channel.try_send(OnDrop(None)).is_ok());
+            channel.clear();
+            assert_eq!(*seen.borrow(), Some(0), "the portion left in one visit");
+            assert_eq!(channel.len(), 1, "the message sent meanwhile stays");
         }
 
         #[test]
