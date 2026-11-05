@@ -600,7 +600,7 @@ where
                     Poll::Pending
                 }
             },
-            None => panic!("Message cannot be None"),
+            None => Poll::Ready(()),
         }
     }
 }
@@ -626,7 +626,7 @@ impl<'ch, T> Future for DynamicSendFuture<'ch, T> {
                     Poll::Pending
                 }
             },
-            None => panic!("Message cannot be None"),
+            None => Poll::Ready(()),
         }
     }
 }
@@ -841,38 +841,43 @@ where
         }
     }
 
-    fn lock<R>(&self, f: impl FnOnce(&mut ChannelState<T, N>) -> R) -> R {
-        self.inner.lock(|rc| f(&mut *unwrap!(rc.try_borrow_mut())))
+    /// Run `f` on the state with `arg`. The raw mutex excludes every other
+    /// borrow of the state; `busy` answers from `arg` if one ever exists.
+    fn lock<A, R>(&self, arg: A, f: impl FnOnce(&mut ChannelState<T, N>, A) -> R, busy: impl FnOnce(A) -> R) -> R {
+        self.inner.lock(|rc| match rc.try_borrow_mut() {
+            Ok(mut state) => f(&mut *state, arg),
+            Err(_) => busy(arg),
+        })
     }
 
     fn try_receive_with_context(&self, cx: Option<&mut Context<'_>>) -> Result<T, TryReceiveError> {
-        self.lock(|c| c.try_receive_with_context(cx))
+        self.lock(cx, |c, cx| c.try_receive_with_context(cx), |_| Err(TryReceiveError::Empty))
     }
 
     fn try_peek_with_context(&self, cx: Option<&mut Context<'_>>) -> Result<T, TryReceiveError>
     where
         T: Clone,
     {
-        self.lock(|c| c.try_peek_with_context(cx))
+        self.lock(cx, |c, cx| c.try_peek_with_context(cx), |_| Err(TryReceiveError::Empty))
     }
 
     /// Poll the channel for the next message
     pub fn poll_receive(&self, cx: &mut Context<'_>) -> Poll<T> {
-        self.lock(|c| c.poll_receive(cx))
+        self.lock(cx, |c, cx| c.poll_receive(cx), |_| Poll::Pending)
     }
 
     fn try_send_with_context(&self, m: T, cx: Option<&mut Context<'_>>) -> Result<(), TrySendError<T>> {
-        self.lock(|c| c.try_send_with_context(m, cx))
+        self.lock((m, cx), |c, (m, cx)| c.try_send_with_context(m, cx), |(m, _)| Err(TrySendError::Full(m)))
     }
 
     /// Allows a poll_fn to poll until the channel is ready to receive
     pub fn poll_ready_to_receive(&self, cx: &mut Context<'_>) -> Poll<()> {
-        self.lock(|c| c.poll_ready_to_receive(cx))
+        self.lock(cx, |c, cx| c.poll_ready_to_receive(cx), |_| Poll::Pending)
     }
 
     /// Allows a poll_fn to poll until the channel is ready to send
     pub fn poll_ready_to_send(&self, cx: &mut Context<'_>) -> Poll<()> {
-        self.lock(|c| c.poll_ready_to_send(cx))
+        self.lock(cx, |c, cx| c.poll_ready_to_send(cx), |_| Poll::Pending)
     }
 
     /// Get a sender for this channel.
@@ -917,7 +922,7 @@ where
     /// buffered values where `n` is the argument passed to [`Channel`], then an
     /// error is returned.
     pub fn try_send(&self, message: T) -> Result<(), TrySendError<T>> {
-        self.lock(|c| c.try_send(message))
+        self.lock(message, |c, message| c.try_send(message), |message| Err(TrySendError::Full(message)))
     }
 
     /// Receive the next value.
@@ -941,7 +946,7 @@ where
     /// This method will either receive a message from the channel immediately or return an error
     /// if the channel is empty.
     pub fn try_receive(&self) -> Result<T, TryReceiveError> {
-        self.lock(|c| c.try_receive())
+        self.lock((), |c, ()| c.try_receive(), |()| Err(TryReceiveError::Empty))
     }
 
     /// Peek at the next value without removing it from the queue.
@@ -952,7 +957,7 @@ where
     where
         T: Clone,
     {
-        self.lock(|c| c.try_peek())
+        self.lock((), |c, ()| c.try_peek(), |()| Err(TryReceiveError::Empty))
     }
 
     /// Returns the maximum number of elements the channel can hold.
@@ -969,22 +974,22 @@ where
 
     /// Clears all elements in the channel.
     pub fn clear(&self) {
-        self.lock(|c| c.clear());
+        self.lock((), |c, ()| c.clear(), |()| ());
     }
 
     /// Returns the number of elements currently in the channel.
     pub fn len(&self) -> usize {
-        self.lock(|c| c.len())
+        self.lock((), |c, ()| c.len(), |()| 0)
     }
 
     /// Returns whether the channel is empty.
     pub fn is_empty(&self) -> bool {
-        self.lock(|c| c.is_empty())
+        self.lock((), |c, ()| c.is_empty(), |()| true)
     }
 
     /// Returns whether the channel is full.
     pub fn is_full(&self) -> bool {
-        self.lock(|c| c.is_full())
+        self.lock((), |c, ()| c.is_full(), |()| false)
     }
 }
 

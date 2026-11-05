@@ -77,7 +77,10 @@ where
     pub fn lock(&self) -> impl Future<Output = MutexGuard<'_, M, T>> {
         poll_fn(|cx| {
             let ready = self.state.lock(|s| {
-                let mut s = s.borrow_mut();
+                // The raw mutex excludes every other borrow of the state.
+                let Ok(mut s) = s.try_borrow_mut() else {
+                    return false;
+                };
                 if s.locked {
                     s.waker.register(cx.waker());
                     false
@@ -100,7 +103,10 @@ where
     /// If the mutex is already locked, this will return an error instead of waiting.
     pub fn try_lock(&self) -> Result<MutexGuard<'_, M, T>, TryLockError> {
         self.state.lock(|s| {
-            let mut s = s.borrow_mut();
+            // The raw mutex excludes every other borrow of the state.
+            let Ok(mut s) = s.try_borrow_mut() else {
+                return Err(TryLockError);
+            };
             if s.locked {
                 Err(TryLockError)
             } else {
@@ -207,9 +213,11 @@ where
 {
     fn drop(&mut self) {
         self.mutex.state.lock(|s| {
-            let mut s = unwrap!(s.try_borrow_mut());
-            s.locked = false;
-            s.waker.wake();
+            // The raw mutex excludes every other borrow of the state.
+            if let Ok(mut s) = s.try_borrow_mut() {
+                s.locked = false;
+                s.waker.wake();
+            }
         })
     }
 }
@@ -321,9 +329,11 @@ where
 {
     fn drop(&mut self) {
         self.state.lock(|s| {
-            let mut s = unwrap!(s.try_borrow_mut());
-            s.locked = false;
-            s.waker.wake();
+            // The raw mutex excludes every other borrow of the state.
+            if let Ok(mut s) = s.try_borrow_mut() {
+                s.locked = false;
+                s.waker.wake();
+            }
         })
     }
 }
