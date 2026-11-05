@@ -9,3 +9,6 @@ pub use waker_registration::*;
 
 mod multi_waker;
 pub use multi_waker::*;
+
+mod wait_slot;
+pub(crate) use wait_slot::*;

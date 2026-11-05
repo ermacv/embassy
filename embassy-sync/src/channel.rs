@@ -43,16 +43,15 @@
 //! }
 //! ```
 
-use core::cell::RefCell;
+use core::cell::Cell;
+use core::fmt;
 use core::future::Future;
 use core::pin::Pin;
-use core::task::{Context, Poll};
-
-use heapless::Deque;
+use core::task::{Context, Poll, Waker};
 
 use crate::blocking_mutex::Mutex;
 use crate::blocking_mutex::raw::RawMutex;
-use crate::waitqueue::WakerRegistration;
+use crate::waitqueue::{WaitSlot, wake};
 
 /// Send-only access to a [`Channel`].
 #[derive(Debug)]
@@ -314,7 +313,7 @@ where
     /// See [`Channel::try_peek()`]
     pub fn try_peek(&self) -> Result<T, TryReceiveError>
     where
-        T: Clone,
+        T: Copy,
     {
         self.channel.try_peek()
     }
@@ -409,7 +408,7 @@ impl<'ch, T> DynamicReceiver<'ch, T> {
     /// See [`Channel::try_peek()`]
     pub fn try_peek(&self) -> Result<T, TryReceiveError>
     where
-        T: Clone,
+        T: Copy,
     {
         self.channel.try_peek_with_context(None)
     }
@@ -649,7 +648,7 @@ pub(crate) trait DynamicChannel<T> {
 
     fn try_peek_with_context(&self, cx: Option<&mut Context<'_>>) -> Result<T, TryReceiveError>
     where
-        T: Clone;
+        T: Copy;
 
     fn poll_ready_to_send(&self, cx: &mut Context<'_>) -> Poll<()>;
     fn poll_ready_to_receive(&self, cx: &mut Context<'_>) -> Poll<()>;
@@ -674,135 +673,90 @@ pub enum TrySendError<T> {
     Full(T),
 }
 
-#[derive(Debug)]
+/// The channel's state, kept in cells: a message's `clone` and `drop` and a
+/// waker's `clone`, `wake` and `drop` are foreign code, which may call the
+/// channel again, so none runs inside the state and every step leaves it whole.
 struct ChannelState<T, const N: usize> {
-    queue: Deque<T, N>,
-    receiver_waker: WakerRegistration,
-    senders_waker: WakerRegistration,
+    /// The `len` messages from `head`, in order, wrapping at `N`.
+    slots: [Cell<Option<T>>; N],
+    head: Cell<usize>,
+    len: Cell<usize>,
+    receiver_waker: WaitSlot,
+    senders_waker: WaitSlot,
+}
+
+impl<T, const N: usize> fmt::Debug for ChannelState<T, N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ChannelState")
+            .field("len", &self.len.get())
+            .finish_non_exhaustive()
+    }
 }
 
 impl<T, const N: usize> ChannelState<T, N> {
     const fn new() -> Self {
         ChannelState {
-            queue: Deque::new(),
-            receiver_waker: WakerRegistration::new(),
-            senders_waker: WakerRegistration::new(),
+            slots: [const { Cell::new(None) }; N],
+            head: Cell::new(0),
+            len: Cell::new(0),
+            receiver_waker: WaitSlot::new(),
+            senders_waker: WaitSlot::new(),
         }
     }
 
-    fn try_receive(&mut self) -> Result<T, TryReceiveError> {
-        self.try_receive_with_context(None)
+    /// The position `offset` places after the head, for an `offset` up to `N`.
+    fn position(&self, offset: usize) -> usize {
+        let at = self.head.get().wrapping_add(offset);
+        if at >= N { at.wrapping_sub(N) } else { at }
     }
 
-    fn try_peek(&mut self) -> Result<T, TryReceiveError>
+    /// Queue `message` behind the others, or hand it back when there is no room.
+    fn push(&self, message: T) -> Result<(), T> {
+        let len = self.len.get();
+        let place = if len < N {
+            self.slots.get(self.position(len))
+        } else {
+            None
+        };
+        let Some(place) = place else {
+            return Err(message);
+        };
+        place.set(Some(message));
+        self.len.set(len.wrapping_add(1));
+        Ok(())
+    }
+
+    /// The message at the head, out of the queue.
+    fn pop(&self) -> Option<T> {
+        let message = self.slots.get(self.head.get())?.take()?;
+        self.head.set(self.position(1));
+        self.len.set(self.len.get().wrapping_sub(1));
+        Some(message)
+    }
+
+    /// The message at the head. `Copy` runs no foreign code.
+    fn front(&self) -> Option<T>
     where
-        T: Clone,
+        T: Copy,
     {
-        self.try_peek_with_context(None)
+        self.slots.get(self.head.get())?.get()
     }
 
-    fn try_peek_with_context(&mut self, cx: Option<&mut Context<'_>>) -> Result<T, TryReceiveError>
-    where
-        T: Clone,
-    {
-        if self.queue.is_full() {
-            self.senders_waker.wake();
-        }
-
-        if let Some(message) = self.queue.front() {
-            Ok(message.clone())
+    /// The senders to wake, when a full queue is about to get room.
+    fn senders_to_wake(&self) -> Option<Waker> {
+        if self.is_full() {
+            self.senders_waker.take()
         } else {
-            if let Some(cx) = cx {
-                self.receiver_waker.register(cx.waker());
-            }
-            Err(TryReceiveError::Empty)
+            None
         }
-    }
-
-    fn try_receive_with_context(&mut self, cx: Option<&mut Context<'_>>) -> Result<T, TryReceiveError> {
-        if self.queue.is_full() {
-            self.senders_waker.wake();
-        }
-
-        if let Some(message) = self.queue.pop_front() {
-            Ok(message)
-        } else {
-            if let Some(cx) = cx {
-                self.receiver_waker.register(cx.waker());
-            }
-            Err(TryReceiveError::Empty)
-        }
-    }
-
-    fn poll_receive(&mut self, cx: &mut Context<'_>) -> Poll<T> {
-        if self.queue.is_full() {
-            self.senders_waker.wake();
-        }
-
-        if let Some(message) = self.queue.pop_front() {
-            Poll::Ready(message)
-        } else {
-            self.receiver_waker.register(cx.waker());
-            Poll::Pending
-        }
-    }
-
-    fn poll_ready_to_receive(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        self.receiver_waker.register(cx.waker());
-
-        if !self.queue.is_empty() {
-            Poll::Ready(())
-        } else {
-            Poll::Pending
-        }
-    }
-
-    fn try_send(&mut self, message: T) -> Result<(), TrySendError<T>> {
-        self.try_send_with_context(message, None)
-    }
-
-    fn try_send_with_context(&mut self, message: T, cx: Option<&mut Context<'_>>) -> Result<(), TrySendError<T>> {
-        match self.queue.push_back(message) {
-            Ok(()) => {
-                self.receiver_waker.wake();
-                Ok(())
-            }
-            Err(message) => {
-                if let Some(cx) = cx {
-                    self.senders_waker.register(cx.waker());
-                }
-                Err(TrySendError::Full(message))
-            }
-        }
-    }
-
-    fn poll_ready_to_send(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        self.senders_waker.register(cx.waker());
-
-        if !self.queue.is_full() {
-            Poll::Ready(())
-        } else {
-            Poll::Pending
-        }
-    }
-
-    fn clear(&mut self) {
-        if self.queue.is_full() {
-            self.senders_waker.wake();
-        }
-        self.queue.clear();
-    }
-
-    fn len(&self) -> usize {
-        self.queue.len()
     }
 
     fn is_empty(&self) -> bool {
-        self.queue.is_empty()
+        self.len.get() == 0
     }
 
     fn is_full(&self) -> bool {
-        self.queue.is_full()
+        self.len.get() == N
     }
 }
 
@@ -819,7 +773,7 @@ pub struct Channel<M, T, const N: usize>
 where
     M: RawMutex,
 {
-    inner: Mutex<M, RefCell<ChannelState<T, N>>>,
+    inner: Mutex<M, ChannelState<T, N>>,
 }
 
 impl<M, T, const N: usize> Channel<M, T, N>
@@ -837,47 +791,126 @@ where
     /// ```
     pub const fn new() -> Self {
         Self {
-            inner: Mutex::new(RefCell::new(ChannelState::new())),
+            inner: Mutex::new(ChannelState::new()),
         }
     }
 
-    /// Run `f` on the state with `arg`. The raw mutex excludes every other
-    /// borrow of the state; `busy` answers from `arg` if one ever exists.
-    fn lock<A, R>(&self, arg: A, f: impl FnOnce(&mut ChannelState<T, N>, A) -> R, busy: impl FnOnce(A) -> R) -> R {
-        self.inner.lock(|rc| match rc.try_borrow_mut() {
-            Ok(mut state) => f(&mut *state, arg),
-            Err(_) => busy(arg),
-        })
+    /// Run `step` on the state. It answers, or hands `arg` back when the
+    /// caller has to wait; with a context, the caller then stays the waiter
+    /// of `place` until something wakes it.
+    ///
+    /// Foreign code runs only between the visits to the state: the waker
+    /// `step` hands out, and the context's clone, after which `step` runs
+    /// again on what the state became. The waiter is in its place before
+    /// the one it displaced wakes.
+    fn run<A, R>(
+        &self,
+        arg: A,
+        cx: Option<&mut Context<'_>>,
+        place: impl Fn(&ChannelState<T, N>) -> &WaitSlot,
+        step: impl Fn(&ChannelState<T, N>, A) -> (Result<R, A>, Option<Waker>),
+    ) -> Result<R, A> {
+        let waker = cx.as_ref().map(|cx| cx.waker());
+        let (answer, woken, unregistered) = self.inner.lock(|s| {
+            let (answer, woken) = step(s, arg);
+            let unregistered = answer.is_err() && waker.is_some_and(|waker| !place(s).holds(waker));
+            (answer, woken, unregistered)
+        });
+        wake(woken);
+        let (arg, waker) = match (answer, waker) {
+            (Err(arg), Some(waker)) if unregistered => (arg, waker),
+            (answer, _) => return answer,
+        };
+        let fresh = waker.clone();
+        let (answer, woken, spare) = self.inner.lock(|s| {
+            let (answer, woken) = step(s, arg);
+            let spare = if answer.is_err() {
+                place(s).replace(fresh)
+            } else {
+                Some(fresh)
+            };
+            (answer, woken, spare)
+        });
+        wake(woken);
+        if answer.is_err() {
+            // The displaced waiter wakes to wait again.
+            wake(spare);
+        } else {
+            drop(spare);
+        }
+        answer
     }
 
     fn try_receive_with_context(&self, cx: Option<&mut Context<'_>>) -> Result<T, TryReceiveError> {
-        self.lock(cx, |c, cx| c.try_receive_with_context(cx), |_| Err(TryReceiveError::Empty))
+        self.run(
+            (),
+            cx,
+            |s| &s.receiver_waker,
+            |s, ()| {
+                let woken = s.senders_to_wake();
+                (s.pop().ok_or(()), woken)
+            },
+        )
+        .map_err(|()| TryReceiveError::Empty)
     }
 
     fn try_peek_with_context(&self, cx: Option<&mut Context<'_>>) -> Result<T, TryReceiveError>
     where
-        T: Clone,
+        T: Copy,
     {
-        self.lock(cx, |c, cx| c.try_peek_with_context(cx), |_| Err(TryReceiveError::Empty))
+        self.run(
+            (),
+            cx,
+            |s| &s.receiver_waker,
+            |s, ()| {
+                let woken = s.senders_to_wake();
+                (s.front().ok_or(()), woken)
+            },
+        )
+        .map_err(|()| TryReceiveError::Empty)
     }
 
     /// Poll the channel for the next message
     pub fn poll_receive(&self, cx: &mut Context<'_>) -> Poll<T> {
-        self.lock(cx, |c, cx| c.poll_receive(cx), |_| Poll::Pending)
+        match self.try_receive_with_context(Some(cx)) {
+            Ok(message) => Poll::Ready(message),
+            Err(TryReceiveError::Empty) => Poll::Pending,
+        }
     }
 
     fn try_send_with_context(&self, m: T, cx: Option<&mut Context<'_>>) -> Result<(), TrySendError<T>> {
-        self.lock((m, cx), |c, (m, cx)| c.try_send_with_context(m, cx), |(m, _)| Err(TrySendError::Full(m)))
+        self.run(
+            m,
+            cx,
+            |s| &s.senders_waker,
+            |s, m| match s.push(m) {
+                Ok(()) => (Ok(()), s.receiver_waker.take()),
+                Err(m) => (Err(m), None),
+            },
+        )
+        .map_err(TrySendError::Full)
     }
 
     /// Allows a poll_fn to poll until the channel is ready to receive
     pub fn poll_ready_to_receive(&self, cx: &mut Context<'_>) -> Poll<()> {
-        self.lock(cx, |c, cx| c.poll_ready_to_receive(cx), |_| Poll::Pending)
+        let ready = self.run(
+            (),
+            Some(cx),
+            |s| &s.receiver_waker,
+            |s, ()| (if s.is_empty() { Err(()) } else { Ok(()) }, None),
+        );
+        if ready.is_ok() { Poll::Ready(()) } else { Poll::Pending }
     }
 
     /// Allows a poll_fn to poll until the channel is ready to send
     pub fn poll_ready_to_send(&self, cx: &mut Context<'_>) -> Poll<()> {
-        self.lock(cx, |c, cx| c.poll_ready_to_send(cx), |_| Poll::Pending)
+        let ready = self.run(
+            (),
+            Some(cx),
+            |s| &s.senders_waker,
+            |s, ()| (if s.is_full() { Err(()) } else { Ok(()) }, None),
+        );
+        if ready.is_ok() { Poll::Ready(()) } else { Poll::Pending }
     }
 
     /// Get a sender for this channel.
@@ -922,7 +955,7 @@ where
     /// buffered values where `n` is the argument passed to [`Channel`], then an
     /// error is returned.
     pub fn try_send(&self, message: T) -> Result<(), TrySendError<T>> {
-        self.lock(message, |c, message| c.try_send(message), |message| Err(TrySendError::Full(message)))
+        self.try_send_with_context(message, None)
     }
 
     /// Receive the next value.
@@ -946,7 +979,7 @@ where
     /// This method will either receive a message from the channel immediately or return an error
     /// if the channel is empty.
     pub fn try_receive(&self) -> Result<T, TryReceiveError> {
-        self.lock((), |c, ()| c.try_receive(), |()| Err(TryReceiveError::Empty))
+        self.try_receive_with_context(None)
     }
 
     /// Peek at the next value without removing it from the queue.
@@ -955,9 +988,9 @@ where
     /// an error if the channel is empty.
     pub fn try_peek(&self) -> Result<T, TryReceiveError>
     where
-        T: Clone,
+        T: Copy,
     {
-        self.lock((), |c, ()| c.try_peek(), |()| Err(TryReceiveError::Empty))
+        self.try_peek_with_context(None)
     }
 
     /// Returns the maximum number of elements the channel can hold.
@@ -972,24 +1005,27 @@ where
         N - self.len()
     }
 
-    /// Clears all elements in the channel.
+    /// Clears the elements the channel holds when this is called.
     pub fn clear(&self) {
-        self.lock((), |c, ()| c.clear(), |()| ());
+        // Each message drops outside the state: its drop is foreign code.
+        for _ in 0..self.len() {
+            drop(self.try_receive());
+        }
     }
 
     /// Returns the number of elements currently in the channel.
     pub fn len(&self) -> usize {
-        self.lock((), |c, ()| c.len(), |()| 0)
+        self.inner.lock(|s| s.len.get())
     }
 
     /// Returns whether the channel is empty.
     pub fn is_empty(&self) -> bool {
-        self.lock((), |c, ()| c.is_empty(), |()| true)
+        self.inner.lock(ChannelState::is_empty)
     }
 
     /// Returns whether the channel is full.
     pub fn is_full(&self) -> bool {
-        self.lock((), |c, ()| c.is_full(), |()| false)
+        self.inner.lock(ChannelState::is_full)
     }
 }
 
@@ -1009,7 +1045,7 @@ where
 
     fn try_peek_with_context(&self, cx: Option<&mut Context<'_>>) -> Result<T, TryReceiveError>
     where
-        T: Clone,
+        T: Copy,
     {
         Channel::try_peek_with_context(self, cx)
     }
@@ -1073,20 +1109,20 @@ mod tests {
     use super::*;
     use crate::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
 
-    fn capacity<T, const N: usize>(c: &ChannelState<T, N>) -> usize {
-        c.queue.capacity() - c.queue.len()
+    fn capacity<M: RawMutex, T, const N: usize>(c: &Channel<M, T, N>) -> usize {
+        c.capacity() - c.len()
     }
 
     #[test]
     fn sending_once() {
-        let mut c = ChannelState::<u32, 3>::new();
+        let c = Channel::<NoopRawMutex, u32, 3>::new();
         assert!(c.try_send(1).is_ok());
         assert_eq!(capacity(&c), 2);
     }
 
     #[test]
     fn sending_when_full() {
-        let mut c = ChannelState::<u32, 3>::new();
+        let c = Channel::<NoopRawMutex, u32, 3>::new();
         let _ = c.try_send(1);
         let _ = c.try_send(1);
         let _ = c.try_send(1);
@@ -1099,7 +1135,7 @@ mod tests {
 
     #[test]
     fn receiving_once_with_one_send() {
-        let mut c = ChannelState::<u32, 3>::new();
+        let c = Channel::<NoopRawMutex, u32, 3>::new();
         assert!(c.try_send(1).is_ok());
         assert_eq!(c.try_receive().unwrap(), 1);
         assert_eq!(capacity(&c), 3);
@@ -1107,7 +1143,7 @@ mod tests {
 
     #[test]
     fn receiving_when_empty() {
-        let mut c = ChannelState::<u32, 3>::new();
+        let c = Channel::<NoopRawMutex, u32, 3>::new();
         match c.try_receive() {
             Err(TryReceiveError::Empty) => assert!(true),
             _ => assert!(false),
@@ -1207,5 +1243,189 @@ mod tests {
         );
         send_task_1.unwrap().await;
         send_task_2.unwrap().await;
+    }
+
+    mod reentry {
+        use core::cell::RefCell;
+        use core::future::Future;
+        use core::pin::pin;
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        use core::task::{Context, Poll};
+        use std::boxed::Box;
+        use std::rc::Rc;
+
+        use super::{Channel, TrySendError};
+        use crate::blocking_mutex::raw::CriticalSectionRawMutex as Raw;
+        use crate::waitqueue::hooks::{Event, on, ran, waker};
+
+        fn channel<T: 'static, const N: usize>() -> &'static Channel<Raw, T, N> {
+            Box::leak(Box::new(Channel::new()))
+        }
+
+        #[test]
+        fn a_receive_from_a_wake_inside_registration_takes_the_message() {
+            let channel = channel::<u32, 1>();
+            channel.try_send(7).unwrap();
+            let (first, _) = waker();
+            let (second, _) = waker();
+            assert!(
+                channel
+                    .poll_ready_to_send(&mut Context::from_waker(&first))
+                    .is_pending()
+            );
+            let (receiver, _) = waker();
+            static ANSWER: AtomicUsize = AtomicUsize::new(0);
+            on(Event::Wake, move || {
+                if let Poll::Ready(message) = channel.poll_receive(&mut Context::from_waker(&receiver)) {
+                    ANSWER.store(message as usize, Ordering::SeqCst);
+                }
+            });
+            assert!(
+                channel
+                    .poll_ready_to_send(&mut Context::from_waker(&second))
+                    .is_pending()
+            );
+            assert!(ran(Event::Wake));
+            assert_eq!(ANSWER.load(Ordering::SeqCst), 7);
+            assert!(channel.is_empty());
+        }
+
+        #[test]
+        fn a_send_from_a_wake_inside_registration_reaches_the_new_waiter() {
+            let channel = channel::<u32, 1>();
+            let (first, _) = waker();
+            let (second, second_wakes) = waker();
+            assert!(channel.poll_receive(&mut Context::from_waker(&first)).is_pending());
+            on(Event::Wake, move || assert_eq!(channel.try_send(9), Ok(())));
+            assert!(channel.poll_receive(&mut Context::from_waker(&second)).is_pending());
+            assert!(ran(Event::Wake));
+            assert_eq!(second_wakes.load(Ordering::SeqCst), 1, "the waiter is told");
+            assert_eq!(channel.poll_receive(&mut Context::from_waker(&second)), Poll::Ready(9));
+        }
+
+        #[test]
+        fn nested_reads_inside_registration_answer_the_truth() {
+            let channel = channel::<u32, 2>();
+            channel.try_send(1).unwrap();
+            channel.try_send(2).unwrap();
+            let (first, _) = waker();
+            let (second, _) = waker();
+            assert!(
+                channel
+                    .poll_ready_to_send(&mut Context::from_waker(&first))
+                    .is_pending()
+            );
+            on(Event::Wake, move || {
+                assert_eq!(channel.len(), 2);
+                assert!(channel.is_full());
+                assert!(!channel.is_empty());
+                assert_eq!(channel.try_peek(), Ok(1));
+                assert_eq!(channel.try_send(3), Err(TrySendError::Full(3)));
+            });
+            assert!(
+                channel
+                    .poll_ready_to_send(&mut Context::from_waker(&second))
+                    .is_pending()
+            );
+            assert!(ran(Event::Wake));
+        }
+
+        #[test]
+        fn a_message_sent_by_the_wakers_clone_answers_the_same_poll() {
+            let channel = channel::<u32, 1>();
+            let (first, _) = waker();
+            on(Event::Clone, move || channel.try_send(5).unwrap());
+            assert_eq!(channel.poll_receive(&mut Context::from_waker(&first)), Poll::Ready(5));
+        }
+
+        #[test]
+        fn room_made_by_the_wakers_clone_lets_the_same_poll_send() {
+            let channel = channel::<u32, 1>();
+            channel.try_send(1).unwrap();
+            let (first, _) = waker();
+            on(Event::Clone, move || assert_eq!(channel.try_receive(), Ok(1)));
+            let mut send = pin!(channel.send(2));
+            assert!(send.as_mut().poll(&mut Context::from_waker(&first)).is_ready());
+            assert_eq!(channel.try_receive(), Ok(2));
+        }
+
+        #[test]
+        fn a_wait_survives_a_call_from_the_wakers_clone() {
+            let channel = channel::<u32, 1>();
+            let (first, first_wakes) = waker();
+            on(Event::Clone, move || assert!(channel.is_empty()));
+            assert!(channel.poll_receive(&mut Context::from_waker(&first)).is_pending());
+            channel.try_send(4).unwrap();
+            assert_eq!(first_wakes.load(Ordering::SeqCst), 1);
+        }
+
+        #[test]
+        fn a_sender_stays_a_waiter_when_a_receive_wakes_only_the_other() {
+            let channel = channel::<u32, 1>();
+            channel.try_send(1).unwrap();
+            let (first, first_wakes) = waker();
+            let (second, second_wakes) = waker();
+            let mut a = pin!(channel.send(2));
+            assert!(a.as_mut().poll(&mut Context::from_waker(&first)).is_pending());
+            let mut b = pin!(channel.send(3));
+            assert!(b.as_mut().poll(&mut Context::from_waker(&second)).is_pending());
+            assert_eq!(first_wakes.load(Ordering::SeqCst), 1, "displaced, to wait again");
+            assert_eq!(channel.try_receive(), Ok(1));
+            assert_eq!(second_wakes.load(Ordering::SeqCst), 1);
+            assert!(b.as_mut().poll(&mut Context::from_waker(&second)).is_ready());
+            assert!(a.as_mut().poll(&mut Context::from_waker(&first)).is_pending());
+        }
+
+        struct OnDrop(Option<Box<dyn FnOnce()>>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                if let Some(hook) = self.0.take() {
+                    hook();
+                }
+            }
+        }
+
+        #[test]
+        fn a_message_dropped_by_clear_may_call_the_channel() {
+            let channel = channel::<OnDrop, 2>();
+            let seen = Rc::new(RefCell::new(None));
+            let told = seen.clone();
+            let first = OnDrop(Some(Box::new(move || {
+                *told.borrow_mut() = Some(channel.len());
+            })));
+            assert!(channel.try_send(first).is_ok());
+            assert!(channel.try_send(OnDrop(None)).is_ok());
+            let (sender, sender_wakes) = waker();
+            assert!(
+                channel
+                    .poll_ready_to_send(&mut Context::from_waker(&sender))
+                    .is_pending()
+            );
+            channel.clear();
+            assert_eq!(*seen.borrow(), Some(1), "the drop saw the queue without its message");
+            assert!(channel.is_empty());
+            assert_eq!(sender_wakes.load(Ordering::SeqCst), 1, "room reaches the sender");
+        }
+
+        #[test]
+        fn a_channel_keeps_order_across_the_wrap() {
+            let channel = channel::<u32, 3>();
+            for round in 0..10 {
+                channel.try_send(round).unwrap();
+                channel.try_send(round + 100).unwrap();
+                assert_eq!(channel.try_peek(), Ok(round));
+                assert_eq!(channel.len(), 2);
+                assert_eq!(channel.try_receive(), Ok(round));
+                assert_eq!(channel.try_receive(), Ok(round + 100));
+            }
+            assert_eq!(channel.try_receive(), Err(super::TryReceiveError::Empty));
+        }
+
+        #[test]
+        fn a_channel_without_room_refuses_and_returns_the_message() {
+            let channel = channel::<u32, 0>();
+            assert_eq!(channel.try_send(1), Err(TrySendError::Full(1)));
+            assert_eq!(channel.try_receive(), Err(super::TryReceiveError::Empty));
+        }
     }
 }

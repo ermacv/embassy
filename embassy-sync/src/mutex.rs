@@ -1,15 +1,15 @@
 //! Async mutex.
 //!
 //! This module provides a mutex that can be used to synchronize data between asynchronous tasks.
-use core::cell::{RefCell, UnsafeCell};
+use core::cell::{Cell, UnsafeCell};
 use core::future::{Future, poll_fn};
 use core::ops::{Deref, DerefMut};
-use core::task::Poll;
+use core::task::{Poll, Waker};
 use core::{fmt, mem};
 
 use crate::blocking_mutex::Mutex as BlockingMutex;
 use crate::blocking_mutex::raw::RawMutex;
-use crate::waitqueue::WakerRegistration;
+use crate::waitqueue::{WaitSlot, wake};
 
 /// Error returned by [`Mutex::try_lock`]
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
@@ -18,8 +18,17 @@ pub struct TryLockError;
 
 #[derive(Debug)]
 struct State {
-    locked: bool,
-    waker: WakerRegistration,
+    locked: Cell<bool>,
+    waker: WaitSlot,
+}
+
+impl State {
+    /// Release the lock and hand back its waiter. The state is whole before
+    /// the caller runs the waiter's wake, which may call the mutex again.
+    fn unlock(&self) -> Option<Waker> {
+        self.locked.set(false);
+        self.waker.take()
+    }
 }
 
 /// Async mutex.
@@ -42,7 +51,7 @@ where
     M: RawMutex,
     T: ?Sized,
 {
-    state: BlockingMutex<M, RefCell<State>>,
+    state: BlockingMutex<M, State>,
     inner: UnsafeCell<T>,
 }
 
@@ -58,10 +67,10 @@ where
     pub const fn new(value: T) -> Self {
         Self {
             inner: UnsafeCell::new(value),
-            state: BlockingMutex::new(RefCell::new(State {
-                locked: false,
-                waker: WakerRegistration::new(),
-            })),
+            state: BlockingMutex::new(State {
+                locked: Cell::new(false),
+                waker: WaitSlot::new(),
+            }),
         }
     }
 }
@@ -76,24 +85,42 @@ where
     /// This will wait for the mutex to be unlocked if it's already locked.
     pub fn lock(&self) -> impl Future<Output = MutexGuard<'_, M, T>> {
         poll_fn(|cx| {
-            let ready = self.state.lock(|s| {
-                // The raw mutex excludes every other borrow of the state.
-                let Ok(mut s) = s.try_borrow_mut() else {
-                    return false;
-                };
-                if s.locked {
-                    s.waker.register(cx.waker());
-                    false
+            let waker = cx.waker();
+            let first = self.state.lock(|s| {
+                if s.locked.get() {
+                    Some(s.waker.holds(waker))
                 } else {
-                    s.locked = true;
-                    true
+                    s.locked.set(true);
+                    None
                 }
             });
-
-            if ready {
-                Poll::Ready(MutexGuard { mutex: self })
-            } else {
-                Poll::Pending
+            match first {
+                None => Poll::Ready(MutexGuard { mutex: self }),
+                Some(true) => Poll::Pending,
+                Some(false) => {
+                    // The clone runs outside the state, which may change
+                    // meanwhile: the second look decides again.
+                    let fresh = waker.clone();
+                    let second = self.state.lock(|s| {
+                        if s.locked.get() {
+                            Err(s.waker.replace(fresh))
+                        } else {
+                            s.locked.set(true);
+                            Ok(fresh)
+                        }
+                    });
+                    match second {
+                        Ok(spare) => {
+                            let guard = MutexGuard { mutex: self };
+                            drop(spare);
+                            Poll::Ready(guard)
+                        }
+                        Err(displaced) => {
+                            wake(displaced);
+                            Poll::Pending
+                        }
+                    }
+                }
             }
         })
     }
@@ -103,14 +130,10 @@ where
     /// If the mutex is already locked, this will return an error instead of waiting.
     pub fn try_lock(&self) -> Result<MutexGuard<'_, M, T>, TryLockError> {
         self.state.lock(|s| {
-            // The raw mutex excludes every other borrow of the state.
-            let Ok(mut s) = s.try_borrow_mut() else {
-                return Err(TryLockError);
-            };
-            if s.locked {
+            if s.locked.get() {
                 Err(TryLockError)
             } else {
-                s.locked = true;
+                s.locked.set(true);
                 Ok(())
             }
         })?;
@@ -212,13 +235,7 @@ where
     T: ?Sized,
 {
     fn drop(&mut self) {
-        self.mutex.state.lock(|s| {
-            // The raw mutex excludes every other borrow of the state.
-            if let Ok(mut s) = s.try_borrow_mut() {
-                s.locked = false;
-                s.waker.wake();
-            }
-        })
+        wake(self.mutex.state.lock(State::unlock));
     }
 }
 
@@ -277,7 +294,7 @@ where
     M: RawMutex,
     T: ?Sized,
 {
-    state: &'a BlockingMutex<M, RefCell<State>>,
+    state: &'a BlockingMutex<M, State>,
     value: *mut T,
 }
 
@@ -328,13 +345,7 @@ where
     T: ?Sized,
 {
     fn drop(&mut self) {
-        self.state.lock(|s| {
-            // The raw mutex excludes every other borrow of the state.
-            if let Ok(mut s) = s.try_borrow_mut() {
-                s.locked = false;
-                s.waker.wake();
-            }
-        })
+        wake(self.state.lock(State::unlock));
     }
 }
 
@@ -398,5 +409,99 @@ mod tests {
         }
 
         assert_eq!(*mutex.lock().await, [0, 3]);
+    }
+
+    mod reentry {
+        use core::future::Future;
+        use core::pin::pin;
+        use core::sync::atomic::Ordering;
+        use core::task::Context;
+        use std::boxed::Box;
+
+        use crate::blocking_mutex::raw::CriticalSectionRawMutex as Raw;
+        use crate::mutex::Mutex;
+        use crate::waitqueue::hooks::{Event, on, ran, waker};
+
+        fn mutex() -> &'static Mutex<Raw, u32> {
+            Box::leak(Box::new(Mutex::new(0)))
+        }
+
+        #[test]
+        fn a_guard_dropped_by_the_wake_of_a_displaced_waiter_unlocks_and_wakes_its_successor() {
+            let mutex = mutex();
+            let guard = mutex.try_lock().unwrap();
+            let (first, _) = waker();
+            let (second, second_wakes) = waker();
+            let mut a = pin!(mutex.lock());
+            assert!(a.as_mut().poll(&mut Context::from_waker(&first)).is_pending());
+            on(Event::Wake, move || drop(guard));
+            let mut b = pin!(mutex.lock());
+            assert!(b.as_mut().poll(&mut Context::from_waker(&second)).is_pending());
+            assert!(ran(Event::Wake));
+            assert_eq!(second_wakes.load(Ordering::SeqCst), 1, "the successor is told");
+            assert!(b.as_mut().poll(&mut Context::from_waker(&second)).is_ready());
+        }
+
+        #[test]
+        fn a_wake_inside_registration_sees_the_lock_as_it_is() {
+            let mutex = mutex();
+            let guard = mutex.try_lock().unwrap();
+            let (first, _) = waker();
+            let (second, _) = waker();
+            let mut a = pin!(mutex.lock());
+            assert!(a.as_mut().poll(&mut Context::from_waker(&first)).is_pending());
+            on(Event::Wake, move || assert!(mutex.try_lock().is_err(), "still held"));
+            let mut b = pin!(mutex.lock());
+            assert!(b.as_mut().poll(&mut Context::from_waker(&second)).is_pending());
+            assert!(ran(Event::Wake));
+            drop(guard);
+            assert!(mutex.try_lock().is_ok());
+        }
+
+        #[test]
+        fn a_guard_dropped_by_the_wakers_clone_lets_the_same_poll_take_the_lock() {
+            let mutex = mutex();
+            let guard = mutex.try_lock().unwrap();
+            let (first, _) = waker();
+            on(Event::Clone, move || drop(guard));
+            let mut a = pin!(mutex.lock());
+            let held = match a.as_mut().poll(&mut Context::from_waker(&first)) {
+                core::task::Poll::Ready(held) => held,
+                core::task::Poll::Pending => panic!("the lock came free during the clone"),
+            };
+            assert!(mutex.try_lock().is_err(), "the poll holds it");
+            drop(held);
+            assert!(mutex.try_lock().is_ok());
+        }
+
+        #[test]
+        fn a_spare_clones_drop_finds_the_lock_held_by_the_poll_that_took_it() {
+            let mutex = mutex();
+            let guard = mutex.try_lock().unwrap();
+            let (first, _) = waker();
+            on(Event::Clone, move || {
+                on(Event::Drop, move || assert!(mutex.try_lock().is_err()));
+                drop(guard);
+            });
+            let mut a = pin!(mutex.lock());
+            assert!(a.as_mut().poll(&mut Context::from_waker(&first)).is_ready());
+            assert!(ran(Event::Drop));
+            assert!(mutex.try_lock().is_ok());
+        }
+
+        #[test]
+        fn a_mapped_guard_dropped_by_a_wake_unlocks() {
+            use crate::mutex::{MappedMutexGuard, MutexGuard};
+            let mutex = mutex();
+            let guard: MappedMutexGuard<'static, Raw, u32> = MutexGuard::map(mutex.try_lock().unwrap(), |v| v);
+            let (first, _) = waker();
+            let (second, _) = waker();
+            let mut a = pin!(mutex.lock());
+            assert!(a.as_mut().poll(&mut Context::from_waker(&first)).is_pending());
+            on(Event::Wake, move || drop(guard));
+            let mut b = pin!(mutex.lock());
+            assert!(b.as_mut().poll(&mut Context::from_waker(&second)).is_pending());
+            assert!(mutex.try_lock().is_ok());
+        }
     }
 }
