@@ -149,7 +149,7 @@ xarxa = { git = "https://github.com/ermacv/xarxa.git", rev = "45ddde5904aad35bd8
 xarxa-driver = { git = "https://github.com/ermacv/xarxa.git", rev = "45ddde5904aad35bd81a802897e18b98fe70e654", default-features = false, features = ["async"] }
 embassy-time = { version = "0.5.1", path = "../embassy-time" }
 embassy-futures = { version = "0.1.2", path = "../embassy-futures" }
-embassy-sync = { version = "0.8.0", path = "../embassy-sync" }
+embassy-sync = "0.8.0"
 embedded-io-async = { version = "0.7.0" }
 
 heapless = { version = "0.9", default-features = false }
