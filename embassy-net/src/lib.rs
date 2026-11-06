@@ -137,6 +137,22 @@ pub(crate) struct Inner<'d, D: Driver> {
     pub(crate) static_dns_servers: heapless::Vec<wire::IpAddr, { config::DNS_MAX_SERVER_COUNT }>,
 }
 
+/// A general packet pool with its unique availability waiter, claimed for one
+/// stack ([`Stack::new`]).
+pub struct ClaimedPool {
+    allocator: PacketBufAllocator,
+    waiter: PacketPoolWaiter,
+}
+
+impl ClaimedPool {
+    /// Claim `allocator`'s waiter; `None` when another stack holds it. Dropping
+    /// the claim gives the waiter back.
+    pub fn claim(allocator: PacketBufAllocator) -> Option<Self> {
+        let waiter = allocator.try_claim_waiter()?;
+        Some(Self { allocator, waiter })
+    }
+}
+
 /// A network stack.
 ///
 /// This is a handle to the stack created by [`Stack::new`]. It's `Copy`, so
@@ -168,20 +184,17 @@ impl<'d, D: Driver> Stack<'d, D> {
     /// The stack starts out with no interfaces: add them with
     /// [`add_iface_borrowed`](Self::add_iface_borrowed).
     ///
-    /// # Panics
-    ///
-    /// Panics if another asynchronous stack already owns the allocator's wake
-    /// registration. Use a separate general packet pool for each independently
-    /// polled stack.
+    /// `pool` holds the allocator's wake registration: a separate general
+    /// packet pool serves each independently polled stack.
     pub fn new(
         storage: &'d mut StackStorage<'d, D>,
         random_seed: u64,
-        packet_allocator: PacketBufAllocator,
+        pool: ClaimedPool,
     ) -> (Self, Runner<'d, D>) {
-        let packet_pool_waiter = unwrap!(
-            packet_allocator.try_claim_waiter(),
-            "an async network stack requires a packet pool with no other waiter"
-        );
+        let ClaimedPool {
+            allocator: packet_allocator,
+            waiter: packet_pool_waiter,
+        } = pool;
         let StackStorage {
             stack,
             inner: inner_slot,
@@ -804,6 +817,17 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn a_claimed_pool_refuses_a_second_stack_until_it_is_dropped() {
+        let storage = Box::leak(Box::new(PacketPoolStorage::<1>::new()));
+        let pool = Box::leak(Box::new(PacketPool::new(storage)));
+        let allocator = pool.allocator();
+        let claimed = ClaimedPool::claim(allocator).unwrap();
+        assert!(ClaimedPool::claim(allocator).is_none());
+        drop(claimed);
+        assert!(ClaimedPool::claim(allocator).is_some());
+    }
+
     struct TestDriver;
 
     impl Driver for TestDriver {
@@ -866,7 +890,8 @@ mod tests {
         address: Ipv4Addr,
     ) -> (Stack<'static, TestDriver>, Runner<'static, TestDriver>, IfaceHandle) {
         let storage = Box::leak(Box::new(StackStorage::new()));
-        let (stack, runner) = Stack::new(storage, 1, allocator);
+        let pool = ClaimedPool::claim(allocator).unwrap();
+        let (stack, runner) = Stack::new(storage, 1, pool);
         let iface = stack.add_iface_borrowed(Box::leak(Box::new(TestDriver))).unwrap();
         iface.add_ip_addr(IpCidr::new(address.into(), 24)).unwrap();
         (stack, runner, iface.handle())
@@ -991,7 +1016,8 @@ mod tests {
         let only = allocator.try_alloc().expect("the only packet slot must allocate");
         let frame = datagram(only, remote, local, &[1, 2, 3]);
         let stack_storage = Box::leak(Box::new(StackStorage::new()));
-        let (stack, runner) = Stack::new(stack_storage, 1, allocator);
+        let pool = ClaimedPool::claim(allocator).unwrap();
+        let (stack, runner) = Stack::new(stack_storage, 1, pool);
         let iface = stack
             .add_iface_borrowed(Box::leak(Box::new(OneFrame(Some(frame)))))
             .unwrap();
